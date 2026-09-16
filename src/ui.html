@@ -955,10 +955,21 @@
       stepList.replaceChildren();
       if (!e.steps.length) { stepList.hidden = true; return; }
       stepList.hidden = false;
-      stepList.append(el("label", { style: "font-size:10.5px;letter-spacing:.08em;color:var(--ink-3);font-weight:700;text-transform:uppercase", text: "금액 이력" }));
-      // 할부는 적어 둔 전체 금액을 회차로 나눈 값이 한 달 몫이다
-      const baseKrw = base.currency === "KRW" ? base.amount : base.amount * (base.rate || 1);
-      const baseMonthly = e.mode === "split" ? baseKrw / Math.max(1, e.months || 1) : baseKrw;
+      // 할부는 지금 칸에 적힌 전체 금액을 회차로 나눈 값이 한 달 몫이다 (고치는 즉시 반영)
+      const curKrw = e.currency === "KRW" ? (e.amount || 0) : (e.amount || 0) * (e.rate || rateFor(e));
+      const baseMonthly = e.mode === "split" ? curKrw / Math.max(1, e.months || 1) : curKrw;
+      stepList.append(el("div", { style: "display:flex;align-items:center;gap:8px" }, [
+        el("label", { style: "font-size:10.5px;letter-spacing:.08em;color:var(--ink-3);font-weight:700;text-transform:uppercase", text: "금액 이력" }),
+        el("button", {
+          class: "btn sm quiet", type: "button", style: "margin-left:auto;padding:3px 9px;font-size:11px",
+          onclick: () => { e.steps = []; drawSteps(); sync(); }
+        }, [icon("eraser", 12), "모두 지우기"])
+      ]));
+      // 적어 둔 값이 자동 계산과 너무 동떨어지면 전체 금액을 잘못 넣은 것이다
+      const odd = e.mode === "split" && baseMonthly > 0 && e.steps.some(s => stepKrw(s) > baseMonthly * 2.5);
+      if (odd) stepList.append(el("div", { class: "banner", style: "font-size:11.5px" }, [
+        `적어 둔 월 납입액이 자동 계산(${money(baseMonthly)})보다 훨씬 큽니다. 전체 금액을 월 납입액 자리에 잘못 넣었을 수 있어요 — '모두 지우기'로 자동 계산으로 되돌릴 수 있습니다.`
+      ]));
       stepList.append(el("div", { class: "tile-row" }, [
         el("span", { class: "t", text: dot(startMonth(e)) + " 부터" }),
         e.mode === "split" ? el("span", { class: "pill" }, ["자동"]) : null,
@@ -1022,12 +1033,14 @@
       if (e.mode === "split") {
         const s = startMonth(e), last = addMonths(s, Math.max(1, e.months) - 1);
         const auto = total / Math.max(1, e.months);
-        // 적어 둔 달이 있으면 자동 계산보다 더 낸 만큼이 이자다
-        const extra = (e.steps || []).reduce((t, st) => t + Math.max(0, stepKrw(st) - auto), 0);
+        // 달별로 적어 둔 금액이 있으면 그것이 자동 계산을 덮는다 — 안 보이면 "왜 안 바뀌지"가 된다
+        const covering = stepAt(e, anchorYm);
         setKids(preview,
           el("span", { text: `자동 월 ${money(auto)} · ${dot(s)} ~ ${dot(last)}` + (last < NOW_YM ? " · 완납" : ` · 지금 ${Math.min(Math.max(seqAt(e, NOW_YM), 1), e.months)}/${e.months}회차`) }),
-          extra ? el("span", { style: "color:var(--gold);margin-left:8px", text: `· 적어 둔 이자 ${money(extra)}` }) : null
+          covering ? el("div", { style: "color:var(--gold);margin-top:4px" },
+            [`${dot(anchorYm)} 은 따로 적어 둔 ${money(stepKrw(covering))} 으로 잡힙니다 — 자동 계산으로 되돌리려면 아래 금액 이력을 지우세요`]) : null
         );
+        drawSteps();
       } else if (e.mode === "monthly") {
         preview.textContent = `매달 ${money(total)}${e.endMonth ? ` · ${dot(e.endMonth)}까지` : " · 끝날 때까지 자동"}`
           + (amountMoved() && change.how === "from" ? ` · ${dot(change.ym)}부터` : "");
