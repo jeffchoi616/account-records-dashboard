@@ -104,6 +104,10 @@
   .yearpick button{padding:4px 11px;border-radius:999px;color:var(--ink-3);font-size:12.5px;font-weight:600;font-variant-numeric:tabular-nums}
   .yearpick button:hover{color:var(--ink)}
   .yearpick button[aria-pressed="true"]{background:linear-gradient(150deg,var(--violet-hi),var(--violet-deep));color:#fff;box-shadow:var(--glow)}
+  .yearpick .arw{padding:3px 8px;font-size:16px;line-height:1.1}
+  .yearpick .lbl{background:linear-gradient(150deg,var(--violet-hi),var(--violet-deep));color:#fff;box-shadow:var(--glow);min-width:62px;text-align:center}
+  .yearpick .mode{border:1px solid var(--edge);margin-left:4px;min-width:26px}
+  .yearpick .mode:hover{border-color:var(--edge-hi);color:var(--ink)}
   .content{padding:24px 28px 64px;display:flex;flex-direction:column;gap:26px;flex:1}
 
   .chip{
@@ -221,13 +225,15 @@
   .mini .top{display:flex;align-items:center;gap:7px;color:var(--ink-3);font-size:11.5px}
   .mini .v{font-family:var(--fd);font-weight:800;font-size:19px;letter-spacing:-.03em;font-variant-numeric:tabular-nums;margin-top:3px}
   .mini .c{font-size:11px;color:var(--ink-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .mini .track{display:block;height:6px;border-radius:99px;background:var(--sky);overflow:hidden}
+  .mini .fill{display:block;height:100%;border-radius:99px}
 
   /* ---------- table ---------- */
   .panel{border-radius:var(--r);background:var(--glass);border:1px solid var(--edge);backdrop-filter:blur(16px);overflow:hidden}
   .panel-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:15px 18px;border-bottom:1px solid var(--edge)}
   .panel-head h2{font-size:14.5px;font-weight:800}
   .table-wrap{overflow-x:auto}
-  table{border-collapse:collapse;width:100%;min-width:640px}
+  table{border-collapse:collapse;width:100%;min-width:720px}
   th,td{padding:10px 16px;text-align:left;font-size:12.8px;border-bottom:1px solid rgba(255,255,255,.06);vertical-align:middle}
   th{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-3);font-weight:700}
   td.r,th.r{text-align:right;font-variant-numeric:tabular-nums}
@@ -462,7 +468,8 @@
   /* ========================== 상태 ========================== */
   const NOW_YM = ymOf(todayISO());
   const S = {
-    view: { type: "dash" }, year: +NOW_YM.slice(0, 4), q: "",
+    // 기본은 '이번 달'. 연도를 고르면 그 해 12달을 한꺼번에 본다.
+    view: { type: "dash" }, year: +NOW_YM.slice(0, 4), month: NOW_YM, q: "",
     groups: [], cards: [], cats: [], entries: [],
     rates: { base: { USD: 1380, CNY: 192 } },
     db: null, sample: null, downloads: null, imagesOK: false,
@@ -478,6 +485,10 @@
   const catById = id => S.cats.find(c => c.id === id);
   const catName = id => (catById(id) || {}).name || "";
   const ownerOf = e => groupById(e.parent) || cardById(e.parent) || {};
+  // 지출 형식 — 카드 명세에 들어온 줄은 그 카드로 굳는다. 나머지는 기록할 때 고른다.
+  const paidByCard = e => e.kind === "card" || e.pay === "card";
+  const payCardOf = e => (e.kind === "card" ? cardById(e.parent) : cardById(e.payCard)) || null;
+  const payLabel = e => paidByCard(e) ? ((payCardOf(e) || {}).name || "카드") : "현금";
 
   /* ========================== 금액 계산 ========================== */
   function rateFor(e) {
@@ -521,8 +532,21 @@
     return `${+addMonths(billYm, -1).slice(5, 7)}.${d + 1} ~ ${+billYm.slice(5, 7)}.${d}`;
   }
   const entriesOf = (kind, parent) => S.entries.filter(e => e.kind === kind && e.parent === parent);
-  const yearSum = list => list.reduce((s, e) => s + yearTotal(e, S.year), 0);
   const monthSum = (list, ym) => list.filter(e => monthsInYear(e, +ym.slice(0, 4)).includes(ym)).reduce((s, e) => s + perMonth(e), 0);
+
+  /* ---- 보고 있는 기간 ---------------------------------------------------
+     S.month 가 있으면 그 한 달, 없으면 S.year 의 열두 달. 화면의 모든 합계는
+     이 기간만 센다. 달력형 막대는 늘 그 해 열두 달을 보여 준다(맥락). */
+  const isMonthMode = () => !!S.month;
+  const periodMonths = e => {
+    const all = monthsInYear(e, S.year);
+    return S.month ? all.filter(m => m === S.month) : all;
+  };
+  const periodTotal = e => periodMonths(e).length * perMonth(e);
+  const periodSum = list => list.reduce((s, e) => s + periodTotal(e), 0);
+  const inPeriod = e => periodMonths(e).length > 0;
+  const periodLabel = () => (S.month ? dot(S.month) : String(S.year));
+  const periodAnchor = () => S.month || (S.year === +NOW_YM.slice(0, 4) ? NOW_YM : S.year + "-12");
 
   function monthlySeries(list, year) {
     const arr = new Array(12).fill(0);
@@ -547,7 +571,7 @@
   }
   function matchEntry(e, q) {
     if (!q || !q.trim()) return true;
-    const hay = [e.title, catName(e.catId), e.purpose, e.memo, ownerOf(e).name, e.date, e.billMonth,
+    const hay = [e.title, catName(e.catId), e.purpose, e.memo, ownerOf(e).name, e.date, e.billMonth, payLabel(e),
       e.currency !== "KRW" ? e.currency : "", e.mode === "split" ? "할부" : e.mode === "monthly" ? "매달 고정" : "일시불",
       e.mode === "split" ? (isFinished(e) ? "완납" : "진행") : ""].filter(Boolean).join(" ").toLowerCase();
     const total = krwTotal(e), per = perMonth(e);
@@ -720,7 +744,8 @@
       id: uid(), kind: opts.kind, parent: opts.parent, date: todayISO(), title: "",
       amount: 0, currency: "KRW", rate: 0, catId: "", purpose: "", memo: "",
       mode: opts.kind === "card" ? "once" : "split", months: 12, endMonth: "",
-      billMonth: ymOf(todayISO()), periodStart: "", periodEnd: ""
+      billMonth: ymOf(todayISO()), periodStart: "", periodEnd: "",
+      pay: "cash", payCard: ""
     }, opts.entry || {});
     const owner = (opts.kind === "card" ? cardById(e.parent) : groupById(e.parent)) || {};
     e._catText = catName(e.catId);
@@ -738,6 +763,18 @@
     const billIn = input({ type: "month", value: e.billMonth || ymOf(e.date), onchange: ev => { e.billMonth = ev.target.value; sync(); } });
     const monthsBox = field("개월", monthsIn);
     const endBox = field("끝나는 달", endIn, "비우면 계속");
+
+    // 지출 형식 — 현금인가 카드인가. 카드면 어느 카드사인지까지.
+    const cardSelBox = field("카드사", select(
+      [{ v: "", t: "고르기" }].concat(S.cards.map(c => ({ v: c.id, t: c.name }))),
+      e.payCard || "", ev => { e.payCard = ev.target.value; }
+    ), S.cards.length ? null : "카드를 먼저 추가해 주세요");
+    const payBox = opts.kind === "card"
+      ? field("지출 형식", el("div", { class: "chip", style: "align-self:flex-start" }, [icon("card", 12), owner.name || "카드"]),
+          "이 카드 명세에 들어가는 줄입니다")
+      : field("지출 형식", segmented([{ v: "cash", t: "현금" }, { v: "card", t: "카드" }], e.pay === "card" ? "card" : "cash",
+          v => { e.pay = v; cardSelBox.hidden = v !== "card"; }));
+    cardSelBox.hidden = opts.kind === "card" || e.pay !== "card";
 
     const catIn = input({ value: e._catText, placeholder: "생활비 · 가구 · 여행", list: "catlist", oninput: ev => { e._catText = ev.target.value; e.catId = ""; drawCats(); } });
     const catChips = el("div", { class: "chips" });
@@ -775,6 +812,7 @@
         field("기간 시작", input({ type: "date", value: e.periodStart || "", onchange: ev => { e.periodStart = ev.target.value; } })),
         field("기간 끝", input({ type: "date", value: e.periodEnd || "", onchange: ev => { e.periodEnd = ev.target.value; if (e.periodEnd) { e.billMonth = ymOf(e.periodEnd); billIn.value = e.billMonth; sync(); } } }))
       ]) : null,
+      el("div", { class: "grid2" }, [payBox, cardSelBox]),
       field("구분", catIn), catChips,
       /대출|담보|융자/.test(owner.name || "") ? field("용도", input({ value: e.purpose, placeholder: "생활자금 · 전세 · 아파트담보", oninput: ev => { e.purpose = ev.target.value; } })) : null,
       field("메모", el("textarea", { rows: "2", oninput: ev => { e.memo = ev.target.value; } }, [e.memo || ""]))
@@ -808,7 +846,10 @@
               months: e.mode === "split" ? Math.max(1, e.months) : 1,
               endMonth: e.mode === "monthly" ? (e.endMonth || "") : "",
               billMonth: e.kind === "card" ? (e.billMonth || ymOf(e.date)) : "",
-              periodStart: e.periodStart || "", periodEnd: e.periodEnd || ""
+              periodStart: e.periodStart || "", periodEnd: e.periodEnd || "",
+              // 지출 형식 — 카드 명세 줄은 그 카드로 굳는다
+              pay: e.kind === "card" ? "card" : (e.pay === "card" ? "card" : "cash"),
+              payCard: e.kind === "card" ? e.parent : (e.pay === "card" ? (e.payCard || "") : "")
             });
             m.close(); toast(isNew ? "기록했어요." : "고쳤어요.");
           }
@@ -1035,7 +1076,8 @@
               rate: r.currency === "KRW" ? 0 : ((S.rates[ymOf(r.date)] || S.rates.base || {})[r.currency] || 1),
               catId, purpose: "", memo: "",
               mode: r.months > 1 ? "split" : "once", months: r.months, endMonth: "",
-              billMonth: bill.ym, periodStart: parsed.periodStart || "", periodEnd: parsed.periodEnd || ""
+              billMonth: bill.ym, periodStart: parsed.periodStart || "", periodEnd: parsed.periodEnd || "",
+              pay: "card", payCard: card.id
             });
             n++;
           }
@@ -1065,16 +1107,26 @@
     const mk = (t, a, txt) => { const n = document.createElementNS(ns, t); for (const k in a) n.setAttribute(k, a[k]); if (txt !== undefined) n.textContent = txt; return n; };
     const svg = mk("svg", { viewBox: `0 0 ${W} ${H}`, class: "spark", preserveAspectRatio: "none", role: "img",
       "aria-label": `${S.year}년 달별 지출, 가장 큰 달 ${brief(max)}` });
-    const nowI = +NOW_YM.slice(5, 7) - 1, thisYear = +NOW_YM.slice(0, 4) === S.year;
+    // 밝은 막대는 '보고 있는 달'. 연 모드에서는 이번 달을 짚어 준다.
+    const anchor = periodAnchor();
+    const hotI = +anchor.slice(5, 7) - 1, hotYear = +anchor.slice(0, 4) === S.year;
     const top = series.indexOf(max);
     series.forEach((v, i) => {
       const h = Math.max(3, (v / max) * (base - 18));
       const x = pad + i * bw + bw * 0.2, w = bw * 0.6;
-      const hot = thisYear && i === nowI;
+      const hot = hotYear && i === hotI;
+      const ym = S.year + "-" + String(i + 1).padStart(2, "0");
+      // 막대를 누르면 그 달만 본다 — 넓게 잡아 손이 빗나가도 눌리게
+      const hit = mk("rect", { x: pad + i * bw, y: 0, width: bw, height: base, fill: "transparent", style: "cursor:pointer" });
+      hit.addEventListener("click", ev => { ev.stopPropagation(); S.month = ym; render(); });
+      hit.append(mk("title", {}, `${i + 1}월 ${money(v)}`));
       svg.append(mk("rect", { x, y: base - h, width: w, height: h, rx: 3,
-        fill: "#fff", "fill-opacity": hot ? .95 : (v ? .42 : .12) }));
-      svg.append(mk("text", { x: x + w / 2, y: H - 5, "text-anchor": "middle", fill: "rgba(255,255,255,.5)",
+        fill: "#fff", "fill-opacity": hot ? .95 : (v ? .42 : .12), style: "pointer-events:none" }));
+      svg.append(mk("text", { x: x + w / 2, y: H - 5, "text-anchor": "middle",
+        fill: hot ? "rgba(255,255,255,.95)" : "rgba(255,255,255,.5)",
+        "font-weight": hot ? "700" : "400", style: "pointer-events:none",
         "font-size": "9", "font-family": "IBM Plex Sans KR,sans-serif" }, String(i + 1)));
+      svg.append(hit);
     });
     if (max > 0) {
       const x = Math.min(W - 34, Math.max(34, pad + top * bw + bw / 2));
@@ -1098,8 +1150,9 @@
 
   function pillarTile(g) {
     const list = entriesOf("group", g.id);
-    const live = list.filter(e => isRunning(e) && !isFinished(e));
-    const shown = (live.length ? live : list.filter(e => monthsInYear(e, S.year).length)).slice(0, 3);
+    // 보고 있는 기간에 실제로 돈이 나가는 줄을 먼저 보여 준다
+    const inP = list.filter(inPeriod);
+    const shown = (inP.length ? inP : list.filter(e => isRunning(e) && !isFinished(e))).slice(0, 3);
     const rows = el("div", { class: "tile-rows" });
     shown.forEach(e => rows.append(el("div", { class: "tile-row" }, [
       el("span", { class: "t", text: e.purpose || e.title }),
@@ -1110,13 +1163,13 @@
 
     return el("button", {
       class: "tile", "data-sid": g.id, style: `--c:${g.accent || "#b45cff"}`,
-      "aria-label": `${g.name} ${S.year}년 ${money(yearSum(list))}`,
+      "aria-label": `${g.name} ${periodLabel()} ${money(periodSum(list))}`,
       onclick: () => { S.view = { type: "group", id: g.id }; clearSearch(); render(); }
     }, [
       el("span", { class: "grip", "aria-hidden": "true" }, [icon("grip", 15, 2.4)]),
       el("span", { class: "tile-ico" }, [icon(iconFor(g.name), 20)]),
       el("span", { class: "tile-nm", text: g.name }),
-      el("span", { class: "tile-sum", text: brief(yearSum(list)) }),
+      el("span", { class: "tile-sum", text: brief(periodSum(list)) }),
       rows
     ]);
   }
@@ -1135,13 +1188,13 @@
     ]);
     return el("button", {
       class: "tile", "data-sid": c.id, style: `--c:${c.accent || "#ff6fd8"}`,
-      "aria-label": `${c.name} ${S.year}년 ${money(yearSum(list))}`,
+      "aria-label": `${c.name} ${periodLabel()} ${money(periodSum(list))}`,
       onclick: () => { S.view = { type: "card", id: c.id }; clearSearch(); render(); }
     }, [
       el("span", { class: "grip", "aria-hidden": "true" }, [icon("grip", 15, 2.4)]),
       el("span", { class: "tile-ico" }, [icon("card", 20)]),
       el("span", { class: "tile-nm", text: c.name }),
-      el("span", { class: "tile-sum", text: brief(yearSum(list)) }),
+      el("span", { class: "tile-sum", text: brief(periodSum(list)) }),
       rows
     ]);
   }
@@ -1150,9 +1203,10 @@
   function viewDash() {
     const root = el("div", { style: "display:flex;flex-direction:column;gap:26px" });
     const all = S.entries;
-    const total = yearSum(all);
-    const thisMonth = monthSum(all, NOW_YM);
-    const prevMonth = monthSum(all, addMonths(NOW_YM, -1));
+    const total = periodSum(all);
+    const anchor = periodAnchor();                 // 달 모드면 그 달, 연 모드면 이번 달
+    const thisMonth = monthSum(all, anchor);
+    const prevMonth = monthSum(all, addMonths(anchor, -1));
     const diff = thisMonth - prevMonth;
 
     if (all.some(e => e.demo)) root.append(el("div", { class: "banner" }, [
@@ -1165,25 +1219,28 @@
       }, ["지우기"])
     ]));
 
+    const left = all.reduce((s, e) => s + leftToPay(e), 0);
+    const caps = [];
+    if (!isMonthMode()) caps.push(el("span", {}, [icon("wallet", 13), " 이달 ", el("b", { class: "num", text: brief(monthSum(all, NOW_YM)) })]));
+    if (prevMonth) caps.push(el("span", { style: `color:${diff > 0 ? "var(--rose)" : "var(--mint)"}` },
+      [(diff > 0 ? "▲ " : "▼ ") + brief(Math.abs(diff)), el("span", { style: "color:var(--ink-3);margin-left:5px", text: "지난달 " + brief(prevMonth) })]));
+    if (left) caps.push(el("span", {}, [icon("split", 13), " 남은 할부 ", el("b", { class: "num", text: brief(left) })]));
+
     const hero = el("div", { class: "hero" }, [
-      el("div", { class: "eyebrow", text: S.year + " 총 지출" }),
+      el("div", { class: "eyebrow", text: periodLabel() + (isMonthMode() ? " 지출" : " 총 지출") }),
       el("div", { class: "big num", text: money(total) }),
-      el("div", { class: "cap" }, [
-        el("span", {}, [icon("wallet", 13), " 이달 ", el("b", { class: "num", text: brief(thisMonth) })]),
-        prevMonth ? el("span", { style: `color:${diff > 0 ? "var(--rose)" : "var(--mint)"}` }, [(diff > 0 ? "▲ " : "▼ ") + brief(Math.abs(diff))]) : null,
-        el("span", {}, [icon("split", 13), " 남은 할부 ", el("b", { class: "num", text: brief(all.reduce((s, e) => s + leftToPay(e), 0)) })])
-      ].filter(Boolean)),
+      caps.length ? el("div", { class: "cap" }, caps) : null,
       sparkline(monthlySeries(all, S.year))
     ]);
 
-    // 이달 나가는 돈 — 막대로 (글자 대신 길이로)
+    // 기간 쪼개기 — 글자 대신 막대 길이로
     const side = el("div", { class: "glass side" }, [
-      el("div", { class: "top" }, [icon("clock", 14), el("span", { text: dot(NOW_YM) })]),
-      el("div", { class: "v", text: money(thisMonth) })
+      el("div", { class: "top" }, [icon(isMonthMode() ? "clock" : "chart", 14), el("span", { text: periodLabel() + " 쪼개기" })]),
+      el("div", { class: "v", text: money(total) })
     ]);
-    const parts = S.groups.map(g => ({ n: g.name, c: g.accent || "#b45cff", v: monthSum(entriesOf("group", g.id), NOW_YM) }))
+    const parts = S.groups.map(g => ({ n: g.name, c: g.accent || "#b45cff", v: periodSum(entriesOf("group", g.id)) }))
       // 카드는 여러 장을 합친 줄이라 한 장의 색을 쓰지 않는다
-      .concat([{ n: "카드", c: "linear-gradient(90deg,#ff6fd8,#7ab8ff)", v: monthSum(S.entries.filter(e => e.kind === "card"), NOW_YM) }])
+      .concat([{ n: "카드", c: "linear-gradient(90deg,#ff6fd8,#7ab8ff)", v: periodSum(S.entries.filter(e => e.kind === "card")) }])
       .filter(p => p.v > 0).sort((a, b) => b.v - a.v);
     const pmax = Math.max(1, ...parts.map(p => p.v));
     if (parts.length) parts.forEach(p => side.append(el("div", { class: "bar-row" }, [
@@ -1191,10 +1248,10 @@
       el("span", { class: "track" }, [el("span", { class: "fill", style: `width:${Math.max(4, p.v / pmax * 100)}%;background:${p.c}` })]),
       el("span", { class: "v num", text: brief(p.v) })
     ])));
-    else side.append(el("div", { style: "color:var(--ink-3);font-size:12.5px;padding:6px 0" }, ["이달 지출 없음"]));
+    else side.append(el("div", { style: "color:var(--ink-3);font-size:12.5px;padding:6px 0" }, ["이 기간 지출 없음"]));
 
     // 앞으로 나갈 돈 — 고정·할부는 이미 정해져 있으니 미리 보여준다
-    const next = [1, 2, 3].map(k => { const m = addMonths(NOW_YM, k); return { m, v: monthSum(all, m) }; }).filter(x => x.v > 0);
+    const next = [1, 2, 3].map(k => { const m = addMonths(anchor, k); return { m, v: monthSum(all, m) }; }).filter(x => x.v > 0);
     if (next.length) {
       // 눈금은 '이번 달'에 맞춘다 — 앞으로가 이번 달보다 큰지 한눈에 보이게
       const fmax = Math.max(thisMonth, ...next.map(x => x.v));
@@ -1215,7 +1272,7 @@
     if (canEdit()) gWrap.append(el("button", { class: "tile-add", onclick: () => openNameForm("group") }, [icon("plus", 22)]));
     root.append(el("section", { class: "sec" }, [
       el("div", { class: "sec-head" }, [icon("chart", 15), el("h2", { text: "기둥" }),
-        el("span", { class: "sum num", text: brief(yearSum(S.entries.filter(e => e.kind === "group"))) })]),
+        el("span", { class: "sum num", text: brief(periodSum(S.entries.filter(e => e.kind === "group"))) })]),
       gWrap
     ]));
     sortable(gWrap, ids => saveOrder("groups", ids));
@@ -1227,7 +1284,7 @@
     root.append(el("section", { class: "sec" }, [
       el("div", { class: "sec-head" }, [icon("card", 15), el("h2", { text: "카드" }),
         canEdit() ? el("button", { class: "btn sm", onclick: () => openStatementReader() }, [icon("doc", 14), "명세서"]) : null,
-        el("span", { class: "sum num", text: brief(yearSum(S.entries.filter(e => e.kind === "card"))) })].filter(Boolean)),
+        el("span", { class: "sum num", text: brief(periodSum(S.entries.filter(e => e.kind === "card"))) })].filter(Boolean)),
       cWrap
     ]));
     sortable(cWrap, ids => saveOrder("cards", ids));
@@ -1242,7 +1299,7 @@
   function miniRow() {
     const wrap = el("div", { class: "minis" });
     const byCat = {};
-    S.entries.forEach(e => { const v = yearTotal(e, S.year); if (v) byCat[e.catId || ""] = (byCat[e.catId || ""] || 0) + v; });
+    S.entries.forEach(e => { const v = periodTotal(e); if (v) byCat[e.catId || ""] = (byCat[e.catId || ""] || 0) + v; });
     const top = Object.entries(byCat).sort((a, b) => b[1] - a[1]).slice(0, 4);
     top.forEach(([cid, v]) => wrap.append(el("button", {
       class: "mini", onclick: () => { S.view = { type: "cat", id: cid }; render(); }
@@ -1250,6 +1307,21 @@
       el("div", { class: "top" }, [icon("tag", 13), el("span", { class: "c", text: catName(cid) || "구분 없음" })]),
       el("div", { class: "v", text: brief(v) })
     ])));
+    // 현금인가 카드인가 — 보고 있는 기간 기준
+    const cardPaid = periodSum(S.entries.filter(paidByCard));
+    const cashPaid = periodSum(S.entries.filter(e => !paidByCard(e)));
+    if (cardPaid || cashPaid) wrap.append(el("div", { class: "mini" }, [
+      el("div", { class: "top" }, [icon("wallet", 13), el("span", { class: "c", text: "현금 · 카드" })]),
+      el("div", { class: "v", style: "font-size:15px" }, [
+        el("span", { style: "color:var(--mint)", text: brief(cashPaid) }),
+        el("span", { style: "color:var(--ink-3)", text: " · " }),
+        el("span", { style: "color:var(--sky)", text: brief(cardPaid) })
+      ]),
+      el("span", { class: "track", style: "margin-top:7px" }, [
+        el("span", { class: "fill", style: `width:${Math.round(cashPaid / Math.max(1, cashPaid + cardPaid) * 100)}%;background:var(--mint)` })
+      ])
+    ]));
+
     const running = S.entries.filter(e => e.mode === "split" && isRunning(e));
     wrap.append(el("div", { class: "mini" }, [
       el("div", { class: "top" }, [icon("split", 13), el("span", { class: "c", text: "남은 할부" })]),
@@ -1270,21 +1342,25 @@
 
   /* ========================== 화면 · 장부 ========================== */
   function ledger(list, opts) {
-    const rows = list.filter(e => matchEntry(e, S.q));
+    // 기간 안에서 돈이 나가는 줄만 본다. 검색 중에는 기간을 풀어 전체에서 찾는다.
+    const scoped = S.q.trim() ? list : list.filter(inPeriod);
+    const rows = scoped.filter(e => matchEntry(e, S.q));
     if (!rows.length) return el("div", { class: "empty" }, [
       icon(S.q ? "search" : "doc", 26),
-      el("div", { text: S.q ? "맞는 줄이 없어요" : "비어 있어요" }),
+      el("div", { text: S.q ? "맞는 줄이 없어요" : periodLabel() + " 에 나간 돈이 없어요" }),
       (opts.onAdd && canEdit() && !S.q) ? el("button", { class: "btn primary", onclick: opts.onAdd }, [icon("plus", 14), "첫 줄"]) : null
     ].filter(Boolean));
 
+    // 달 하나만 볼 때는 달 머리글이 군더더기다
+    const byMonth = opts.byMonth && !isMonthMode() && !S.q.trim();
     const tb = el("tbody");
     let lastM = null;
     rows.slice().sort((a, b) => (startMonth(b) + (b.date || "")).localeCompare(startMonth(a) + (a.date || ""))).forEach(e => {
       const m = startMonth(e);
-      if (opts.byMonth && m !== lastM) {
+      if (byMonth && m !== lastM) {
         lastM = m;
         const t = rows.filter(x => startMonth(x) === m).reduce((s, x) => s + krwTotal(x), 0);
-        tb.append(el("tr", { class: "mhead" }, [el("td", { colspan: "5", text: dot(m) }), el("td", { class: "r num", text: money(t) }), el("td", {})]));
+        tb.append(el("tr", { class: "mhead" }, [el("td", { colspan: "6", text: dot(m) + " 새로 잡힌 돈" }), el("td", { class: "r num", text: money(t) }), el("td", {})]));
       }
       const fin = isFinished(e);
       tb.append(el("tr", { class: fin ? "done" : "" }, [
@@ -1292,6 +1368,7 @@
         el("td", {}, [el("div", { style: "font-weight:600", text: e.title }),
           (e.purpose || e.memo) ? el("div", { style: "font-size:11px;color:var(--ink-3)", text: [e.purpose, e.memo].filter(Boolean).join(" · ") }) : null]),
         el("td", {}, [catName(e.catId) ? el("span", { class: "pill" }, [catName(e.catId)]) : el("span", { style: "color:var(--ink-3)" }, ["—"])]),
+        el("td", {}, [el("span", { class: "pill " + (paidByCard(e) ? "sky" : "mint") }, [icon(paidByCard(e) ? "card" : "wallet", 10, 2.2), payLabel(e)])]),
         el("td", {}, [statusPill(e) || el("span", { style: "color:var(--ink-3)", text: "—" })]),
         el("td", { class: "r num", style: "color:var(--ink-3)", text: e.mode === "once" ? "—" : brief(perMonth(e)) }),
         el("td", { class: "r num", style: "font-weight:600", text: (e.currency !== "KRW" ? CUR[e.currency] + won(e.amount) + " → " : "") + money(krwTotal(e)) }),
@@ -1301,9 +1378,15 @@
         ] : [])])
       ]));
     });
+    // 이 기간에 실제로 나간 돈 — 할부·고정은 전체 금액이 아니라 그 달 몫만 센다
+    if (!S.q.trim()) tb.append(el("tr", { class: "mhead" }, [
+      el("td", { colspan: "5", text: periodLabel() + " 나간 돈" }),
+      el("td", { class: "r num", text: money(rows.reduce((s, e) => s + periodTotal(e), 0)) }),
+      el("td", {}), el("td", {})
+    ]));
     return el("div", { class: "table-wrap" }, [el("table", {}, [
       el("thead", {}, [el("tr", {}, [el("th", {}, ["일자"]), el("th", {}, ["내용"]), el("th", {}, ["구분"]),
-        el("th", {}, ["회차"]), el("th", { class: "r" }, ["월"]), el("th", { class: "r" }, ["금액"]), el("th", {}, [""])])]),
+        el("th", {}, ["형식"]), el("th", {}, ["회차"]), el("th", { class: "r" }, ["월"]), el("th", { class: "r" }, ["금액"]), el("th", {}, [""])])]),
       tb
     ])]);
   }
@@ -1328,11 +1411,12 @@
     const left = list.reduce((s, e) => s + leftToPay(e), 0);
     return el("div", { style: "display:flex;flex-direction:column;gap:18px" }, [
       detailHero({
-        eyebrow: S.year, name: g.name, icon: iconFor(g.name), accent: g.accent, sum: yearSum(list),
+        eyebrow: periodLabel(), name: g.name, icon: iconFor(g.name), accent: g.accent, sum: periodSum(list),
         series: monthlySeries(list, S.year),
-        caps: [el("span", {}, [icon("doc", 13), " ", el("b", { text: list.length + "건" })]),
+        caps: [el("span", {}, [icon("doc", 13), " ", el("b", { text: list.filter(inPeriod).length + "건" }),
+            el("span", { style: "color:var(--ink-3);margin-left:5px", text: "전체 " + list.length })]),
           left ? el("span", {}, [icon("split", 13), " 남은 ", el("b", { class: "num", text: brief(left) })]) : null,
-          el("span", {}, [icon("check", 13), " 완납 ", el("b", { text: list.filter(isFinished).length })])].filter(Boolean)
+          list.some(isFinished) ? el("span", {}, [icon("check", 13), " 완납 ", el("b", { text: list.filter(isFinished).length })]) : null].filter(Boolean)
       }),
       el("div", { class: "panel" }, [
         el("div", { class: "panel-head" }, [
@@ -1354,13 +1438,14 @@
     const list = entriesOf("card", c.id);
     const byBill = {};
     list.forEach(e => { const m = e.billMonth || ymOf(e.date); byBill[m] = (byBill[m] || 0) + krwTotal(e); });
-    const bills = Object.entries(byBill).filter(([m]) => m.startsWith(String(S.year))).sort((a, b) => b[0].localeCompare(a[0]));
+    const bills = Object.entries(byBill).filter(([m]) => (S.month ? m === S.month : m.startsWith(String(S.year)))).sort((a, b) => b[0].localeCompare(a[0]));
     const root = el("div", { style: "display:flex;flex-direction:column;gap:18px" }, [
       detailHero({
-        eyebrow: S.year + " · 청구 기준", name: c.name, icon: "card", accent: c.accent, sum: yearSum(list),
+        eyebrow: periodLabel() + " · 청구 기준", name: c.name, icon: "card", accent: c.accent, sum: periodSum(list),
         series: monthlySeries(list, S.year),
-        caps: [el("span", {}, [icon("doc", 13), " ", el("b", { text: list.length + "건" })]),
-          bills.length ? el("span", {}, [icon("clock", 13), " 최근 ", el("b", { text: dot(bills[0][0]) })]) : null].filter(Boolean)
+        caps: [el("span", {}, [icon("doc", 13), " ", el("b", { text: list.filter(inPeriod).length + "건" }),
+            el("span", { style: "color:var(--ink-3);margin-left:5px", text: "전체 " + list.length })]),
+          bills.length ? el("span", {}, [icon("clock", 13), " 청구 ", el("b", { text: dot(bills[0][0]) })]) : null].filter(Boolean)
       })
     ]);
     if (bills.length) {
@@ -1387,15 +1472,15 @@
 
   function viewCat(id) {
     const nm = catName(id) || "구분 없음";
-    const list = S.entries.filter(e => (e.catId || "") === (id || "") && monthsInYear(e, S.year).length);
+    const list = S.entries.filter(e => (e.catId || "") === (id || "") && inPeriod(e));
     const byMonth = {};
-    list.forEach(e => monthsInYear(e, S.year).forEach(m => { (byMonth[m] = byMonth[m] || []).push(e); }));
+    list.forEach(e => periodMonths(e).forEach(m => { (byMonth[m] = byMonth[m] || []).push(e); }));
     const months = Object.keys(byMonth).sort((a, b) => b.localeCompare(a));
     const panel = el("div", { class: "panel" }, [
       el("div", { class: "panel-head" }, [el("h2", { text: "달별" }),
         (id && canEdit()) ? el("button", { class: "btn sm quiet", style: "margin-left:auto", onclick: () => openNameForm("cat", catById(id)) }, [icon("pencil", 13)]) : null].filter(Boolean))
     ]);
-    if (!months.length) panel.append(el("div", { class: "empty" }, [icon("tag", 24), el("div", { text: "이 해에는 기록이 없어요" })]));
+    if (!months.length) panel.append(el("div", { class: "empty" }, [icon("tag", 24), el("div", { text: periodLabel() + " 에는 기록이 없어요" })]));
     months.forEach(m => {
       const rows = byMonth[m].filter(e => matchEntry(e, S.q));
       if (!rows.length) return;
@@ -1414,7 +1499,7 @@
       ])]));
     });
     return el("div", { style: "display:flex;flex-direction:column;gap:18px" }, [
-      detailHero({ eyebrow: S.year + " · 구분", name: nm, icon: "tag", accent: "#5ff0c5", sum: yearSum(list), series: monthlySeries(list, S.year),
+      detailHero({ eyebrow: periodLabel() + " · 구분", name: nm, icon: "tag", accent: "#5ff0c5", sum: periodSum(list), series: monthlySeries(list, S.year),
         caps: [el("span", {}, [icon("doc", 13), " ", el("b", { text: list.length + "건" })])] }),
       panel
     ]);
@@ -1461,9 +1546,9 @@
   }
 
   function viewBackup() {
-    const head = ["종류", "칸", "일자", "내용", "구분", "방식", "개월", "통화", "금액", "환율", "원화", "청구달", "용도", "메모"];
+    const head = ["종류", "칸", "일자", "내용", "구분", "지출형식", "방식", "개월", "통화", "금액", "환율", "원화", "청구달", "용도", "메모"];
     const lines = [head].concat(S.entries.map(e => [
-      e.kind === "card" ? "카드" : "기둥", ownerOf(e).name || "", e.date, e.title, catName(e.catId),
+      e.kind === "card" ? "카드" : "기둥", ownerOf(e).name || "", e.date, e.title, catName(e.catId), payLabel(e),
       e.mode === "split" ? "할부" : e.mode === "monthly" ? "매달" : "일시불",
       e.mode === "split" ? e.months : "", e.currency, e.amount, rateFor(e), Math.round(krwTotal(e)),
       e.billMonth || "", e.purpose || "", String(e.memo || "").replace(/\s+/g, " ")
@@ -1525,17 +1610,17 @@
     }, [icon("home", 15), el("span", { class: "nm", text: "한눈에" })])]));
 
     swap("navPillars", group("기둥",
-      S.groups.map(g => navBtn(g.name, yearSum(entriesOf("group", g.id)), g.accent || "#b45cff",
+      S.groups.map(g => navBtn(g.name, periodSum(entriesOf("group", g.id)), g.accent || "#b45cff",
         S.view.type === "group" && S.view.id === g.id, go({ type: "group", id: g.id }))),
       el("button", { class: "navbtn ghost", onclick: () => openNameForm("group") }, [icon("plus", 13), "항목"])));
 
     swap("navCards", group("카드",
-      S.cards.map(c => navBtn(c.name, yearSum(entriesOf("card", c.id)), c.accent || "#ff6fd8",
+      S.cards.map(c => navBtn(c.name, periodSum(entriesOf("card", c.id)), c.accent || "#ff6fd8",
         S.view.type === "card" && S.view.id === c.id, go({ type: "card", id: c.id }))),
       el("button", { class: "navbtn ghost", onclick: () => openNameForm("card") }, [icon("plus", 13), "카드"])));
 
     const tot = {};
-    S.entries.forEach(e => { const v = yearTotal(e, S.year); if (v) tot[e.catId || ""] = (tot[e.catId || ""] || 0) + v; });
+    S.entries.forEach(e => { const v = periodTotal(e); if (v) tot[e.catId || ""] = (tot[e.catId || ""] || 0) + v; });
     const items = S.cats.slice().sort((a, b) => (tot[b.id] || 0) - (tot[a.id] || 0))
       .map(c => navBtn(c.name, tot[c.id] || 0, "#5ff0c5", S.view.type === "cat" && S.view.id === c.id, go({ type: "cat", id: c.id })));
     if (tot[""]) items.push(navBtn("구분 없음", tot[""], "#6d5f8c", S.view.type === "cat" && S.view.id === "", go({ type: "cat", id: "" })));
@@ -1549,28 +1634,53 @@
 
     $("#rail").classList.toggle("open", S.railOpen);
     $("#railScrim").classList.toggle("on", S.railOpen);
-    $("#brandSub").textContent = S.year + " · " + brief(yearSum(S.entries));
+    $("#brandSub").textContent = periodLabel() + " · " + brief(periodSum(S.entries));
   }
 
-  function renderYears() {
+  function openPeriodPicker() {
+    const years = [...new Set(availableYears().concat([S.year - 1, S.year, S.year + 1]))].sort((a, b) => a - b);
+    const m = modal({
+      title: "기간",
+      body: [
+        field("연", el("div", { class: "chips" }, years.map(y => el("button", {
+          type: "button", "aria-pressed": String(y === S.year),
+          onclick: () => { if (S.month) S.month = y + "-" + S.month.slice(5); S.year = y; m.close(); render(); }
+        }, [String(y)])))),
+        field("달", el("div", { class: "chips" }, [el("button", {
+          type: "button", "aria-pressed": String(!S.month),
+          onclick: () => { S.month = null; m.close(); render(); }
+        }, ["1년 전체"])].concat(Array.from({ length: 12 }, function (_, i) {
+          const ym = S.year + "-" + String(i + 1).padStart(2, "0");
+          return el("button", {
+            type: "button", "aria-pressed": String(S.month === ym),
+            onclick: () => { S.month = ym; m.close(); render(); }
+          }, [(i + 1) + "월"]);
+        }))))
+      ]
+    });
+  }
+
+  function renderPeriod() {
     const box = $("#yearPick");
     box.replaceChildren();
-    const ys = availableYears();
-    const span = ys.length > 4 ? ys.slice(-4) : ys.slice();
-    if (!span.includes(S.year)) span.push(S.year);
-    span.sort((a, b) => a - b).forEach(y => box.append(el("button", {
-      type: "button", "aria-pressed": String(y === S.year), onclick: () => { S.year = y; render(); }
-    }, [String(y).slice(2)])));
-    box.append(el("button", {
-      type: "button", "aria-label": "다른 연도", onclick: () => {
-        const all = [...new Set(ys.concat([S.year - 1, S.year + 1]))].sort((a, b) => a - b);
-        const m = modal({
-          title: "연도", body: [el("div", { class: "chips" }, all.map(y => el("button", {
-            type: "button", "aria-pressed": String(y === S.year), onclick: () => { S.year = y; m.close(); render(); }
-          }, [String(y)])))]
-        });
-      }
-    }, ["⋯"]));
+    const step = d => () => {
+      if (S.month) { S.month = addMonths(S.month, d); S.year = +S.month.slice(0, 4); }
+      else S.year += d;
+      render();
+    };
+    box.append(
+      el("button", { type: "button", class: "arw", "aria-label": "이전", onclick: step(-1) }, ["‹"]),
+      el("button", { type: "button", class: "lbl", "aria-label": "기간 고르기", onclick: openPeriodPicker }, [periodLabel()]),
+      el("button", { type: "button", class: "arw", "aria-label": "다음", onclick: step(1) }, ["›"]),
+      el("button", {
+        type: "button", class: "mode",
+        "aria-label": S.month ? "1년 전체로 보기" : "한 달만 보기",
+        onclick: () => {
+          S.month = S.month ? null : (S.year === +NOW_YM.slice(0, 4) ? NOW_YM : S.year + "-01");
+          render();
+        }
+      }, [S.month ? "연" : "월"])
+    );
   }
 
   function renderChip() {
@@ -1586,7 +1696,7 @@
 
   /* ========================== 렌더 ========================== */
   function render() {
-    renderYears(); renderChip(); renderRail();
+    renderPeriod(); renderChip(); renderRail();
     const host = $("#view");
     host.replaceChildren();
     if (!S.loaded) { host.append(el("div", { class: "empty" }, [el("span", { class: "pulse" }), "여는 중…"])); return; }
@@ -1680,8 +1790,8 @@
   try {
     const hot = window.claude && window.claude.hot;
     if (hot && hot.snapshot) {
-      hot.snapshot(() => ({ view: S.view, year: S.year }));
-      const boot = d => { if (d && d.view) { S.view = d.view; S.year = d.year || S.year; } render(); };
+      hot.snapshot(() => ({ view: S.view, year: S.year, month: S.month }));
+      const boot = d => { if (d && d.view) { S.view = d.view; S.year = d.year || S.year; if (d.month !== undefined) S.month = d.month; } render(); };
       hot.ready ? hot.ready(boot) : boot(hot.data);
     }
   } catch (_) {}
