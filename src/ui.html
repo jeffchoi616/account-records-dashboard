@@ -451,6 +451,9 @@
     return n;
   };
   const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+  // replaceChildren 은 null 을 "null" 글자로 찍는다 — 걸러서 넣는다
+  const setKids = (node, ...kids) => node.replaceChildren(...kids.filter(k => k !== null && k !== undefined && k !== false));
+
   // ₩(U+20A9) 는 가로줄이 글자 폭 밖으로 넘쳐 뒤 숫자를 가로지른다(서체 무관).
   // 그래서 원화는 기호 대신 '원'을 뒤에 붙인다. 달러·위안 기호는 멀쩡하므로 그대로 쓴다.
   const CUR = { KRW: "", USD: "$", CNY: "¥" };
@@ -541,6 +544,34 @@
   }
   const krwAt = (e, ym) => { const s = stepAt(e, ym); return s ? stepKrw(s) : krwTotal(e); };
 
+  /* ---- 치료비와 보험 청구 ------------------------------------------------
+     치료비는 병원에 전액을 내고 나중에 일부만 돌려받는다. 장부가 답해야 하는 질문은
+     "이 치료에 내 돈이 얼마나 들었나"이므로, 실제 부담액(총액 − 돌려받는 돈)을
+     치료받은 달에 적는다. 아직 못 받은 돈은 지출이 아니라 '받을 돈'으로 따로 센다. */
+  const CLAIM_STATE = { todo: "미청구", sent: "청구중", done: "받음", denied: "부지급" };
+  const hasClaim = e => !!(e.claim && e.claim.on);
+  function claimNet(c) {
+    const total = +c.total || 0;
+    if (c.state === "denied") return total;                       // 한 푼도 못 받으면 전액 내 돈
+    if (c.state === "done") return Math.max(0, total - (+c.got || 0));
+    return Math.max(0, total - (+c.expect || 0));                 // 아직이면 예상만큼 빼 둔다
+  }
+  // 아직 못 받은 돈 — 기간과 상관없이 '지금 남아 있는' 잔액이다
+  const claimPending = e => (hasClaim(e) && (e.claim.state === "todo" || e.claim.state === "sent"))
+    ? (+e.claim.expect || 0) : 0;
+  // 청구해 놓고 오래 소식이 없는 건 — 보험금 지급 법정기한을 넘긴 셈이다
+  function claimStale(e) {
+    if (!hasClaim(e) || e.claim.state !== "sent") return 0;
+    const days = Math.floor((Date.now() - new Date(e.date + "T00:00:00").getTime()) / 86400000);
+    return days > 30 ? days : 0;
+  }
+  // 실손 청구는 진료일부터 3년이 지나면 못 받는다
+  function claimExpiring(e) {
+    if (!hasClaim(e) || e.claim.state === "done" || e.claim.state === "denied") return 0;
+    const left = Math.floor((new Date(e.date + "T00:00:00").getTime() + 3 * 365 * 86400000 - Date.now()) / 86400000);
+    return left < 90 ? left : 0;
+  }
+
   // 할부의 자동 월 납입액 — 전체 금액을 회차로 나눈 값. 이자는 여기에 얹힌다.
   const autoMonthly = e => e.mode === "split" ? krwTotal(e) / Math.max(1, e.months || 1) : krwTotal(e);
 
@@ -624,6 +655,7 @@
   function matchEntry(e, q) {
     if (!q || !q.trim()) return true;
     const hay = [e.title, catName(e.catId), e.purpose, e.memo, ownerOf(e).name, e.date, e.billMonth, payLabel(e),
+      hasClaim(e) ? "치료비 " + (CLAIM_STATE[e.claim.state] || "") : "",
       e.currency !== "KRW" ? e.currency : "", e.mode === "split" ? "할부" : e.mode === "monthly" ? "매달 고정" : "일시불",
       e.mode === "split" ? (isFinished(e) ? "완납" : "진행") : ""].filter(Boolean).join(" ").toLowerCase();
     const total = krwTotal(e), per = perMonth(e);
@@ -861,6 +893,52 @@
     const amountBox = field("금액", amtIn);
     const amountLabel = amountBox.querySelector("label");
 
+    /* 치료비 — 병원에 낸 돈과 보험에서 돌려받는 돈을 적으면 실제 부담액이 자동으로 나온다 */
+    const cl = Object.assign({ on: false, total: 0, state: "todo", expect: 0, got: 0, paidDate: "" }, e.claim || {});
+    const clOut = el("div", { class: "hint" });
+    const totalIn = input({ type: "number", step: "1", min: "0", value: cl.total || "", placeholder: "0", oninput: ev => { cl.total = +ev.target.value || 0; claimSync(); } });
+    const expectIn = input({ type: "number", step: "1", min: "0", value: cl.expect || "", placeholder: "0", oninput: ev => { cl.expect = +ev.target.value || 0; claimSync(); } });
+    const gotIn = input({ type: "number", step: "1", min: "0", value: cl.got || "", placeholder: "0", oninput: ev => { cl.got = +ev.target.value || 0; claimSync(); } });
+    const paidIn = input({ type: "date", value: cl.paidDate || "", onchange: ev => { cl.paidDate = ev.target.value; } });
+    const expectBox = field("예상 환급액", expectIn, "공제하고 나면 0원일 수도 있어요");
+    const gotBox = field("받은 금액", gotIn);
+    const paidBox = field("지급일", paidIn);
+    const stateSeg = segmented(Object.keys(CLAIM_STATE).map(k => ({ v: k, t: CLAIM_STATE[k] })), cl.state,
+      v => { cl.state = v; claimSync(); });
+    const claimRows = el("div", { style: "display:flex;flex-direction:column;gap:12px" }, [
+      el("div", { class: "grid2" }, [field("치료비 총액", totalIn), field("상태", stateSeg)]),
+      el("div", { class: "grid3" }, [expectBox, gotBox, paidBox]),
+      clOut
+    ]);
+    const claimToggle = el("button", {
+      type: "button", class: "btn sm quiet", "aria-pressed": String(cl.on),
+      onclick: () => { cl.on = !cl.on; claimSync(); }
+    }, [icon("plus", 13), "치료비 · 보험 청구"]);
+
+    function claimSync() {
+      claimRows.hidden = !cl.on;
+      claimToggle.setAttribute("aria-pressed", String(cl.on));
+      claimToggle.classList.toggle("primary", cl.on);
+      const done = cl.state === "done", denied = cl.state === "denied";
+      expectBox.hidden = done || denied;
+      gotBox.hidden = !done;
+      paidBox.hidden = !done;
+      if (!cl.on) { clOut.replaceChildren(); amtIn.readOnly = false; sync(); return; }
+      const net = claimNet(cl);
+      e.amount = net;                                   // 장부에 실리는 값은 언제나 실제 부담액
+      amtIn.value = net || "";
+      amtIn.readOnly = true;
+      const back = denied ? 0 : done ? (+cl.got || 0) : (+cl.expect || 0);
+      setKids(clOut,
+        el("span", { text: `내 돈 ${money(net)}` }),
+        el("span", { style: "color:var(--ink-3);margin-left:9px", text: `총 ${money(cl.total)} − ${done ? "받음" : denied ? "부지급" : "예상"} ${money(back)}` }),
+        (!done && !denied && back) ? el("span", { class: "pill sky", style: "margin-left:9px" }, ["받을 돈 " + brief(back)]) : null,
+        (done && +cl.got !== +cl.expect && +cl.expect) ? el("div", { style: "margin-top:5px;color:var(--gold)" },
+          [`예상보다 ${(+cl.got > +cl.expect ? "더" : "덜")} 받았어요 · 차액 ${money(Math.abs(+cl.got - +cl.expect))} 만큼 내 돈이 ${(+cl.got > +cl.expect ? "줄었" : "늘었")}습니다`]) : null
+      );
+      sync();
+    }
+
     /* 매달 기록의 금액이 바뀔 때 — 지난 달 기록을 건드리지 않게 고르게 한다 */
     const fromIn = input({ type: "date", value: change.ym + "-01", onchange: ev => { change.ym = ymOf(ev.target.value) || change.ym; sync(); } });
     const changeBox = el("div", { class: "field", style: "gap:8px" }, [
@@ -933,7 +1011,8 @@
 
     // 금액을 바꿨고, 이미 굴러가던 매달 기록이면 → 언제부터 바꿀지 물어본다
     // 할부는 전체 금액을 고친 것이니 계약 정정으로 본다. 달별 금액은 '이 달 금액'으로 적는다.
-    const amountMoved = () => !isNew && e.mode !== "split" && e.amount !== shownAmount;
+    // 치료비는 금액이 자동 계산이라 '손으로 바꾼 것'이 아니다 — 달별 이력을 만들면 안 된다.
+    const amountMoved = () => !isNew && !cl.on && e.mode !== "split" && e.amount !== shownAmount;
 
     function sync() {
       const total = krwTotal(e);
@@ -945,7 +1024,7 @@
         const auto = total / Math.max(1, e.months);
         // 적어 둔 달이 있으면 자동 계산보다 더 낸 만큼이 이자다
         const extra = (e.steps || []).reduce((t, st) => t + Math.max(0, stepKrw(st) - auto), 0);
-        preview.replaceChildren(
+        setKids(preview,
           el("span", { text: `자동 월 ${money(auto)} · ${dot(s)} ~ ${dot(last)}` + (last < NOW_YM ? " · 완납" : ` · 지금 ${Math.min(Math.max(seqAt(e, NOW_YM), 1), e.months)}/${e.months}회차`) }),
           extra ? el("span", { style: "color:var(--gold);margin-left:8px", text: `· 적어 둔 이자 ${money(extra)}` }) : null
         );
@@ -970,6 +1049,7 @@
         field("기간 시작", input({ type: "date", value: e.periodStart || "", onchange: ev => { e.periodStart = ev.target.value; } })),
         field("기간 끝", input({ type: "date", value: e.periodEnd || "", onchange: ev => { e.periodEnd = ev.target.value; if (e.periodEnd) { e.billDate = e.periodEnd; e.billMonth = ymOf(e.periodEnd); billIn.value = e.billDate; sync(); } } }))
       ]) : null,
+      el("div", {}, [claimToggle]), claimRows,
       el("div", { class: "grid2" }, [payBox, cardSelBox]),
       field("구분", catIn), catChips,
       /대출|담보|융자/.test(owner.name || "") ? field("용도", input({ value: e.purpose, placeholder: "생활자금 · 전세 · 아파트담보", oninput: ev => { e.purpose = ev.target.value; } })) : null,
@@ -980,6 +1060,7 @@
     endBox.hidden = e.mode !== "monthly";
     rateBox.hidden = e.currency === "KRW";
     drawSteps();
+    claimSync();
     sync();
 
     const m = modal({
@@ -1025,6 +1106,9 @@
               billMonth: e.kind === "card" ? (e.billMonth || ymOf(e.billDate || e.date)) : "",
               billDate: e.kind === "card" ? (e.billDate || e.date) : "",
               periodStart: e.periodStart || "", periodEnd: e.periodEnd || "",
+              // 치료비 — 장부에 실리는 금액은 위에서 이미 실제 부담액으로 맞춰 뒀다
+              claim: cl.on ? { on: true, total: +cl.total || 0, state: cl.state,
+                expect: +cl.expect || 0, got: +cl.got || 0, paidDate: cl.paidDate || "" } : null,
               // 지출 형식 — 카드 명세 줄은 그 카드로 굳는다
               pay: e.kind === "card" ? "card" : (e.pay === "card" ? "card" : "cash"),
               payCard: e.kind === "card" ? e.parent : (e.pay === "card" ? (e.payCard || "") : "")
@@ -1065,7 +1149,7 @@
       const d = now - prev;
       const auto = autoMonthly(e);
       const interest = e.mode === "split" ? now - auto : 0;
-      out.replaceChildren(
+      setKids(out,
         el("span", { text: dot(st.ym) + " · " + money(now) }),
         prev ? el("span", { style: `margin-left:10px;color:${d > 0 ? "var(--rose)" : d < 0 ? "var(--mint)" : "var(--ink-3)"}` },
           [d === 0 ? "지난달과 같음" : (d > 0 ? "▲ " : "▼ ") + money(Math.abs(d))]) : null,
@@ -1572,6 +1656,17 @@
       ])
     ]));
 
+    // 받을 돈 — 기간과 상관없이 지금 남아 있는 잔액이다
+    const pending = S.entries.reduce((t, e) => t + claimPending(e), 0);
+    const pendingN = S.entries.filter(e => claimPending(e) > 0).length;
+    if (pending) wrap.append(el("button", {
+      class: "mini", onclick: () => { S.view = { type: "claims" }; render(); }
+    }, [
+      el("div", { class: "top" }, [icon("wallet", 13), el("span", { class: "c", text: "받을 돈" })]),
+      el("div", { class: "v", style: "color:var(--sky)", text: brief(pending) }),
+      el("div", { class: "c", text: pendingN + "건 · 눌러서 보기" })
+    ]));
+
     const interest = periodInterest(S.entries);
     if (interest) wrap.append(el("div", { class: "mini" }, [
       el("div", { class: "top" }, [icon("fx", 13), el("span", { class: "c", text: "이자" })]),
@@ -1642,6 +1737,12 @@
       }, [
         el("td", { class: "num", style: "color:var(--ink-3)", text: e.date }),
         el("td", {}, [el("div", { style: "font-weight:600", text: e.title }),
+          hasClaim(e) ? el("div", { style: "font-size:11px;color:var(--ink-3);display:flex;align-items:center;gap:5px" }, [
+            el("span", { text: "총 " + money(+e.claim.total || 0) }),
+            el("span", { class: "pill " + (e.claim.state === "done" ? "mint" : e.claim.state === "denied" ? "rose" : "sky") }, [CLAIM_STATE[e.claim.state] || ""]),
+            claimStale(e) ? el("span", { class: "pill gold" }, [claimStale(e) + "일"]) : null,
+            claimExpiring(e) ? el("span", { class: "pill rose" }, ["기한 " + claimExpiring(e) + "일"]) : null
+          ].filter(Boolean)) : null,
           (e.purpose || e.memo) ? el("div", { style: "font-size:11px;color:var(--ink-3)", text: [e.purpose, e.memo].filter(Boolean).join(" · ") }) : null]),
         el("td", {}, [catName(e.catId) ? el("span", { class: "pill" }, [catName(e.catId)]) : el("span", { style: "color:var(--ink-3)" }, ["—"])]),
         el("td", {}, [el("span", { class: "pill " + (paidByCard(e) ? "sky" : "mint") }, [icon(paidByCard(e) ? "card" : "wallet", 10, 2.2), payLabel(e)])]),
@@ -1809,6 +1910,54 @@
     ]);
   }
 
+  /* 받을 돈 — 청구해 두고 아직 못 받은 치료비. 기간과 상관없이 전부 모아 본다. */
+  function viewClaims() {
+    const list = S.entries.filter(e => claimPending(e) > 0)
+      .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    const total = list.reduce((s, e) => s + claimPending(e), 0);
+    const paid = S.entries.filter(e => hasClaim(e) && e.claim.state === "done");
+    const gotTotal = paid.reduce((s, e) => s + (+e.claim.got || 0), 0);
+
+    const tb = el("tbody");
+    list.forEach(e => {
+      const open = () => openEntryForm({ kind: e.kind, parent: e.parent, entry: e });
+      tb.append(el("tr", {
+        class: canEdit() ? "row" : "", title: canEdit() ? "누르면 고치기" : null,
+        onclick: canEdit() ? open : null
+      }, [
+        el("td", { class: "num", style: "color:var(--ink-3)", text: e.date }),
+        el("td", {}, [el("div", { style: "font-weight:600", text: e.title }),
+          el("div", { style: "font-size:11px;color:var(--ink-3)", text: ownerOf(e).name || "" })]),
+        el("td", {}, [el("span", { class: "pill sky" }, [CLAIM_STATE[e.claim.state]])]),
+        el("td", {}, [
+          claimStale(e) ? el("span", { class: "pill gold" }, ["소식 없음 " + claimStale(e) + "일"]) : null,
+          claimExpiring(e) ? el("span", { class: "pill rose" }, ["기한 " + claimExpiring(e) + "일"]) : null
+        ].filter(Boolean)),
+        el("td", { class: "r num", style: "color:var(--ink-3)", text: money(+e.claim.total || 0) }),
+        el("td", { class: "r num", style: "font-weight:600;color:var(--sky)", text: money(claimPending(e)) })
+      ]));
+    });
+
+    return el("div", { style: "display:flex;flex-direction:column;gap:18px" }, [
+      el("div", { class: "hero", style: "background:linear-gradient(140deg,rgba(122,184,255,.36) 0%,rgba(120,38,214,.32) 52%,rgba(255,111,216,.14) 100%),var(--glass)" }, [
+        el("div", { class: "eyebrow", text: "보험에서 받을 돈" }),
+        el("div", { class: "big num", text: money(total) }),
+        el("div", { class: "cap" }, [
+          el("span", {}, [icon("doc", 13), " ", el("b", { text: list.length + "건" })]),
+          gotTotal ? el("span", {}, [icon("check", 13), " 지금까지 받음 ", el("b", { class: "num", text: brief(gotTotal) })]) : null
+        ].filter(Boolean))
+      ]),
+      el("div", { class: "panel" }, [
+        el("div", { class: "panel-head" }, [icon("wallet", 15), el("h2", { text: "청구 중" }), rowHint()].filter(Boolean)),
+        list.length ? el("div", { class: "table-wrap" }, [el("table", { style: "min-width:620px" }, [
+          el("thead", {}, [el("tr", {}, [el("th", {}, ["진료일"]), el("th", {}, ["내용"]), el("th", {}, ["상태"]),
+            el("th", {}, [""]), el("th", { class: "r" }, ["치료비"]), el("th", { class: "r" }, ["받을 돈"])])]),
+          tb
+        ])]) : el("div", { class: "empty" }, [icon("check", 24), el("div", { text: "받을 돈이 없어요" })])
+      ])
+    ]);
+  }
+
   function viewRates() {
     const base = Object.assign({ USD: 1380, CNY: 192 }, S.rates.base || {});
     const draft = JSON.parse(JSON.stringify(S.rates)); draft.base = base;
@@ -1842,12 +1991,16 @@
   }
 
   function viewBackup() {
-    const head = ["종류", "칸", "일자", "내용", "구분", "지출형식", "방식", "개월", "통화", "금액", "환율", "원화", "월납입", "이자", "청구달", "용도", "메모"];
+    const head = ["종류", "칸", "일자", "내용", "구분", "지출형식", "방식", "개월", "통화", "금액", "환율", "원화", "월납입", "이자",
+      "치료비총액", "청구상태", "예상환급", "받은금액", "지급일", "청구달", "용도", "메모"];
     const lines = [head].concat(S.entries.map(e => [
       e.kind === "card" ? "카드" : "기둥", ownerOf(e).name || "", e.date, e.title, catName(e.catId), payLabel(e),
       e.mode === "split" ? "할부" : e.mode === "monthly" ? "매달" : "일시불",
       e.mode === "split" ? e.months : "", e.currency, e.amount, rateFor(e), Math.round(krwTotal(e)),
       Math.round(perMonth(e)), Math.round(interestAt(e, periodAnchor())),
+      hasClaim(e) ? (+e.claim.total || 0) : "", hasClaim(e) ? (CLAIM_STATE[e.claim.state] || "") : "",
+      hasClaim(e) ? (+e.claim.expect || 0) : "", hasClaim(e) ? (+e.claim.got || 0) : "",
+      hasClaim(e) ? (e.claim.paidDate || "") : "",
       e.billMonth || "", e.purpose || "", String(e.memo || "").replace(/\s+/g, " ")
     ]));
     const csv = "﻿" + lines.map(r => r.map(c => `"${String(c === undefined || c === null ? "" : c).replace(/"/g, '""')}"`).join(",")).join("\r\n");
@@ -1925,6 +2078,11 @@
 
     swap("navTools", group("도구", [
       canEdit() ? el("button", { class: "navbtn", onclick: () => { S.railOpen = false; renderRail(); openStatementReader(); } }, [icon("doc", 15), el("span", { class: "nm", text: "명세서 읽기" })]) : null,
+      S.entries.some(e => claimPending(e) > 0)
+        ? el("button", { class: "navbtn", "aria-current": String(S.view.type === "claims"), onclick: go({ type: "claims" }) },
+            [icon("wallet", 15), el("span", { class: "nm", text: "받을 돈" }),
+             el("span", { class: "amt", text: brief(S.entries.reduce((t, e) => t + claimPending(e), 0)) })])
+        : null,
       el("button", { class: "navbtn", "aria-current": String(S.view.type === "rates"), onclick: go({ type: "rates" }) }, [icon("fx", 15), el("span", { class: "nm", text: "환율" })]),
       el("button", { class: "navbtn", "aria-current": String(S.view.type === "backup"), onclick: go({ type: "backup" }) }, [icon("down", 15), el("span", { class: "nm", text: "내보내기" })])
     ].filter(Boolean)));
@@ -2006,6 +2164,7 @@
       case "rates": node = viewRates(); break;
       case "backup": node = viewBackup(); break;
       case "search": node = viewSearch(); break;
+      case "claims": node = viewClaims(); break;
       default: node = viewDash();
     }
     host.append(node);
