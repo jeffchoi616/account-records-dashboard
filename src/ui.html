@@ -520,7 +520,31 @@
     if (e.mode === "monthly") return e.endMonth || "9999-12";
     return s;
   }
-  const perMonth = e => (e.mode === "split" ? krwTotal(e) / Math.max(1, e.months || 1) : krwTotal(e));
+
+  /* ---- 매달 기록의 금액 이력 -------------------------------------------
+     보험료·월세처럼 매달 나가는 돈은 몇 해 뒤 금액이 오른다. 그때 금액을 그냥
+     고치면 지난 달 기록까지 같이 바뀌어 버린다. 그래서 '이 달부터 이 금액'을
+     steps 에 쌓고, 각 달은 그 달에 유효한 금액으로 센다. 지난 기록은 그대로다. */
+  function stepAt(e, ym) {
+    let best = null;
+    (e.steps || []).forEach(s => {
+      if (s && s.from && s.from <= ym && (!best || s.from > best.from)) best = s;
+    });
+    return best;
+  }
+  function krwAt(e, ym) {
+    const s = stepAt(e, ym);
+    if (!s) return krwTotal(e);
+    const cur = s.currency || "KRW";
+    const amt = +s.amount || 0;
+    if (cur === "KRW") return amt;
+    const r = +s.rate > 0 ? +s.rate : ((S.rates[s.from] || {})[cur] || (S.rates.base || {})[cur] || 1);
+    return amt * r;
+  }
+  // 그 달에 실제로 빠져나가는 돈
+  const perMonthAt = (e, ym) => e.mode === "split" ? krwTotal(e) / Math.max(1, e.months || 1) : krwAt(e, ym);
+  // 지금 보고 있는 기간 기준 — 화면에 한 줄로 보여 줄 때 쓴다
+  const perMonth = e => perMonthAt(e, periodAnchor());
   function monthsInYear(e, year) {
     const y0 = year + "-01", y1 = year + "-12";
     const s = startMonth(e), l = lastMonth(e);
@@ -530,7 +554,6 @@
     while (c <= b && out.length < 13) { out.push(c); c = addMonths(c, 1); }
     return out;
   }
-  const yearTotal = (e, year) => monthsInYear(e, year).length * perMonth(e);
   const seqAt = (e, ym) => monthDiff(startMonth(e), ym) + 1;
   const seqNow = e => Math.min(Math.max(seqAt(e, NOW_YM), 1), Math.max(1, e.months || 1));
   // '완납'은 할부에만 있는 상태다 — 지나간 일시불은 그냥 지난 기록일 뿐
@@ -547,7 +570,7 @@
     return `${+addMonths(billYm, -1).slice(5, 7)}.${d + 1} ~ ${+billYm.slice(5, 7)}.${d}`;
   }
   const entriesOf = (kind, parent) => S.entries.filter(e => e.kind === kind && e.parent === parent);
-  const monthSum = (list, ym) => list.filter(e => monthsInYear(e, +ym.slice(0, 4)).includes(ym)).reduce((s, e) => s + perMonth(e), 0);
+  const monthSum = (list, ym) => list.filter(e => monthsInYear(e, +ym.slice(0, 4)).includes(ym)).reduce((s, e) => s + perMonthAt(e, ym), 0);
 
   /* ---- 보고 있는 기간 ---------------------------------------------------
      S.month 가 있으면 그 한 달, 없으면 S.year 의 열두 달. 화면의 모든 합계는
@@ -557,7 +580,7 @@
     const all = monthsInYear(e, S.year);
     return S.month ? all.filter(m => m === S.month) : all;
   };
-  const periodTotal = e => periodMonths(e).length * perMonth(e);
+  const periodTotal = e => periodMonths(e).reduce((s, m) => s + perMonthAt(e, m), 0);
   const periodSum = list => list.reduce((s, e) => s + periodTotal(e), 0);
   const inPeriod = e => periodMonths(e).length > 0;
   const periodLabel = () => (S.month ? dot(S.month) : String(S.year));
@@ -565,7 +588,7 @@
 
   function monthlySeries(list, year) {
     const arr = new Array(12).fill(0);
-    list.forEach(e => monthsInYear(e, year).forEach(m => { arr[+m.slice(5, 7) - 1] += perMonth(e); }));
+    list.forEach(e => monthsInYear(e, year).forEach(m => { arr[+m.slice(5, 7) - 1] += perMonthAt(e, m); }));
     return arr;
   }
   function availableYears() {
@@ -785,16 +808,32 @@
   /* ========================== 기록 입력 ========================== */
   function openEntryForm(opts) {
     if (!canEdit()) return toast("모바일에서는 보기만 돼요.");
-    const isNew = !opts.entry;
+    const isNew = !opts.entry || !!opts.copy;
     const e = Object.assign({
       id: uid(), kind: opts.kind, parent: opts.parent, date: todayISO(), title: "",
       amount: 0, currency: "KRW", rate: 0, catId: "", purpose: "", memo: "",
       mode: opts.kind === "card" ? "once" : "split", months: 12, endMonth: "",
       billMonth: ymOf(todayISO()), billDate: "", endDate: "", periodStart: "", periodEnd: "",
-      pay: "cash", payCard: ""
+      pay: "cash", payCard: "", steps: []
     }, opts.entry || {});
+    if (opts.copy) { e.id = uid(); e.steps = (e.steps || []).map(s => Object.assign({}, s)); }
     const owner = (opts.kind === "card" ? cardById(e.parent) : groupById(e.parent)) || {};
     e._catText = catName(e.catId);
+    e.steps = (e.steps || []).slice().sort((a, b) => String(a.from).localeCompare(String(b.from)));
+
+    // 매달 기록은 '지금 보고 있는 달'에 유효한 금액을 보여 주고 고치게 한다.
+    // 원래 금액(base)은 따로 들고 있다가, 무엇을 바꿀지 고른 대로 저장한다.
+    const base = { amount: e.amount || 0, currency: e.currency, rate: e.rate || 0 };
+    const anchorYm = periodAnchor();
+    const liveStep = stepAt(e, anchorYm);
+    if (liveStep) {
+      e.amount = +liveStep.amount || 0;
+      e.currency = liveStep.currency || "KRW";
+      e.rate = +liveStep.rate || 0;
+    }
+    const shownAmount = e.amount;
+    // 금액을 바꿨을 때 어떻게 반영할지: "from" = 이 달부터, "base" = 처음부터 고치기
+    const change = { how: "from", ym: anchorYm < startMonth(e) ? startMonth(e) : anchorYm };
 
     const preview = el("div", { class: "hint" });
     const fxLine = el("div", { class: "hint" });
@@ -802,6 +841,37 @@
     const dateIn = input({ type: "date", value: e.date, onchange: ev => { e.date = ev.target.value; if (opts.kind === "card" && isNew) { e.billDate = e.date; e.billMonth = ymOf(e.date); billIn.value = e.billDate; } sync(); } });
     const titleIn = input({ value: e.title, placeholder: opts.kind === "card" ? "가맹점" : "항목", oninput: ev => { e.title = ev.target.value; } });
     const amtIn = input({ type: "number", step: "0.01", min: "0", value: e.amount || "", placeholder: "0", oninput: ev => { e.amount = +ev.target.value || 0; sync(); } });
+
+    /* 매달 기록의 금액이 바뀔 때 — 지난 달 기록을 건드리지 않게 고르게 한다 */
+    const fromIn = input({ type: "date", value: change.ym + "-01", onchange: ev => { change.ym = ymOf(ev.target.value) || change.ym; sync(); } });
+    const changeBox = el("div", { class: "field", style: "gap:8px" }, [
+      el("label", { text: "바뀐 금액을 언제부터" }),
+      segmented([{ v: "from", t: "이 날부터" }, { v: "base", t: "처음부터 고치기" }], change.how,
+        v => { change.how = v; fromIn.parentElement.hidden = v !== "from"; sync(); }),
+      field("", fromIn, "이 날이 든 달부터 새 금액. 그 전 달은 옛 금액 그대로.")
+    ]);
+    changeBox.hidden = true;
+
+    // 지금까지의 금액 이력
+    const stepList = el("div", { style: "display:flex;flex-direction:column;gap:6px" });
+    function drawSteps() {
+      stepList.replaceChildren();
+      if (!e.steps.length) { stepList.hidden = true; return; }
+      stepList.hidden = false;
+      stepList.append(el("label", { style: "font-size:10.5px;letter-spacing:.08em;color:var(--ink-3);font-weight:700;text-transform:uppercase", text: "금액 이력" }));
+      stepList.append(el("div", { class: "tile-row" }, [
+        el("span", { class: "t", text: dot(startMonth(e)) + " 부터" }),
+        el("span", { class: "num", style: "flex:none", text: money(base.currency === "KRW" ? base.amount : base.amount * (base.rate || 1)) })
+      ]));
+      e.steps.forEach(s => stepList.append(el("div", { class: "tile-row" }, [
+        el("span", { class: "t", text: dot(s.from) + " 부터" }),
+        el("span", { class: "num", style: "flex:none", text: money((s.currency || "KRW") === "KRW" ? (+s.amount || 0) : (+s.amount || 0) * (+s.rate || 1)) }),
+        el("button", {
+          class: "iconbtn", type: "button", "aria-label": dot(s.from) + " 이력 지우기",
+          onclick: () => { e.steps = e.steps.filter(x => x !== s); drawSteps(); sync(); }
+        }, [icon("eraser", 13)])
+      ])));
+    }
     const rateBox = field("환율", input({ type: "number", step: "0.01", min: "0", value: e.rate || "", placeholder: "자동", oninput: ev => { e.rate = +ev.target.value || 0; sync(); } }));
     const curSel = select([{ v: "KRW", t: "원" }, { v: "USD", t: "$" }, { v: "CNY", t: "¥" }], e.currency, ev => { e.currency = ev.target.value; rateBox.hidden = e.currency === "KRW"; sync(); });
     const monthsIn = input({ type: "number", min: "1", max: "120", value: e.months || 12, oninput: ev => { e.months = Math.max(1, +ev.target.value || 1); sync(); } });
@@ -836,14 +906,20 @@
     }
     drawCats();
 
+    // 금액을 바꿨고, 이미 굴러가던 매달 기록이면 → 언제부터 바꿀지 물어본다
+    const amountMoved = () => !isNew && e.mode === "monthly" && e.amount !== shownAmount;
+
     function sync() {
       const total = krwTotal(e);
       fxLine.textContent = e.currency === "KRW" ? "" : `${CUR[e.currency]}${won(e.amount)} × ${won(rateFor(e))} → ${money(total)}`;
+      changeBox.hidden = !amountMoved();
       if (e.mode === "split") {
         const s = startMonth(e), last = addMonths(s, Math.max(1, e.months) - 1);
         preview.textContent = `월 ${money(total / Math.max(1, e.months))} · ${dot(s)} ~ ${dot(last)}` + (last < NOW_YM ? " · 완납" : ` · 지금 ${Math.min(Math.max(seqAt(e, NOW_YM), 1), e.months)}/${e.months}회차`);
-      } else if (e.mode === "monthly") preview.textContent = `매달 ${money(total)}${e.endMonth ? ` · ${dot(e.endMonth)}까지` : ""}`;
-      else preview.textContent = money(total);
+      } else if (e.mode === "monthly") {
+        preview.textContent = `매달 ${money(total)}${e.endMonth ? ` · ${dot(e.endMonth)}까지` : " · 끝날 때까지 자동"}`
+          + (amountMoved() && change.how === "from" ? ` · ${dot(change.ym)}부터` : "");
+      } else preview.textContent = money(total);
     }
 
     const body = [
@@ -855,7 +931,7 @@
           v => { e.mode = v; monthsBox.hidden = v !== "split"; endBox.hidden = v !== "monthly"; sync(); })),
         monthsBox
       ]),
-      endBox, preview,
+      endBox, preview, changeBox, stepList,
       opts.kind === "card" ? el("div", { class: "grid3" }, [
         field("청구일", billIn, "이 날이 든 달로 잡힌다"),
         field("기간 시작", input({ type: "date", value: e.periodStart || "", onchange: ev => { e.periodStart = ev.target.value; } })),
@@ -870,13 +946,19 @@
     monthsBox.hidden = e.mode !== "split";
     endBox.hidden = e.mode !== "monthly";
     rateBox.hidden = e.currency === "KRW";
+    drawSteps();
     sync();
 
     const m = modal({
-      title: (isNew ? "새 기록" : "고치기") + " · " + (owner.name || ""),
+      title: (opts.copy ? "복사" : isNew ? "새 기록" : "고치기") + " · " + (owner.name || ""),
       body,
       foot: [
         !isNew ? el("button", { class: "btn danger", onclick: () => { m.close(); confirmSheet("지울까요?", e.title || "이름 없는 기록", "지우기", () => drop("entries", e.id)); } }, ["지우기"]) : null,
+        // 똑같은 내용으로 한 줄 더 — 금액만 바꿔 쓰는 경우가 많다
+        !isNew ? el("button", {
+          class: "btn quiet", style: "margin-right:auto",
+          onclick: () => { m.close(); openEntryForm({ kind: e.kind, parent: e.parent, entry: opts.entry, copy: true }); }
+        }, [icon("doc", 14), "복사"]) : null,
         el("button", { class: "btn quiet", onclick: () => m.close() }, ["취소"]),
         el("button", {
           class: "btn primary", onclick: async () => {
@@ -887,10 +969,22 @@
               if (hit) e.catId = hit.id;
               else { e.catId = uid(); await put("cats", e.catId, { name: txt }); }
             } else e.catId = "";
+
+            // 매달 기록의 금액이 바뀌었으면, 지난 달을 건드릴지 말지 고른 대로 저장한다
+            let saveAmount = e.amount, saveCur = e.currency, saveRate = e.currency === "KRW" ? 0 : (e.rate || rateFor(e));
+            let steps = e.mode === "monthly" ? e.steps.slice() : [];
+            if (amountMoved() && change.how === "from") {
+              const from = change.ym;
+              steps = steps.filter(s => s.from !== from)
+                .concat([{ from, amount: e.amount, currency: e.currency, rate: saveRate }])
+                .sort((a, b) => String(a.from).localeCompare(String(b.from)));
+              saveAmount = base.amount; saveCur = base.currency; saveRate = base.rate;   // 원래 금액은 그대로
+            }
+
             await put("entries", e.id, {
               kind: e.kind, parent: e.parent, date: e.date, title: (e.title || "").trim() || "이름 없는 기록",
               // 환율은 기록할 때 값을 굳힌다 — 나중에 기준을 바꿔도 지난 기록은 흔들리지 않는다
-              amount: e.amount, currency: e.currency, rate: e.currency === "KRW" ? 0 : (e.rate || rateFor(e)), catId: e.catId,
+              amount: saveAmount, currency: saveCur, rate: saveRate, steps: steps, catId: e.catId,
               purpose: e.purpose || "", memo: e.memo || "", mode: e.mode,
               months: e.mode === "split" ? Math.max(1, e.months) : 1,
               endMonth: e.mode === "monthly" ? (e.endMonth || "") : "",
@@ -910,6 +1004,8 @@
     const dl = el("datalist", { id: "catlist" });
     S.cats.forEach(c => dl.append(el("option", { value: c.name })));
     m.sheet.append(dl);
+    // 복사는 대개 금액만 바꾼다 — 바로 금액에 커서를 둔다
+    if (opts.copy) setTimeout(() => { amtIn.focus(); amtIn.select(); }, 60);
   }
 
   /* ========================== 칸 · 카드 · 구분 이름 ========================== */
@@ -1430,6 +1526,7 @@
         onclick: editable ? open : null,
         oncontextmenu: editable ? (ev => contextMenu(ev, [
           { label: "고치기", icon: "pencil", run: open },
+          { label: "복사", icon: "doc", run: () => openEntryForm({ kind: e.kind, parent: e.parent, entry: e, copy: true }) },
           { label: "지우기", icon: "eraser", danger: true, run: erase }
         ])) : null
       }, [
@@ -1440,7 +1537,12 @@
         el("td", {}, [el("span", { class: "pill " + (paidByCard(e) ? "sky" : "mint") }, [icon(paidByCard(e) ? "card" : "wallet", 10, 2.2), payLabel(e)])]),
         el("td", {}, [statusPill(e) || el("span", { style: "color:var(--ink-3)", text: "—" })]),
         el("td", { class: "r num", style: "color:var(--ink-3)", text: e.mode === "once" ? "—" : brief(perMonth(e)) }),
-        el("td", { class: "r num", style: "font-weight:600", text: (e.currency !== "KRW" ? CUR[e.currency] + won(e.amount) + " → " : "") + money(krwTotal(e)) })
+        // 매달 기록은 그 기간에 유효한 금액을 보여 준다(금액이 오른 적 있으면 옛 달은 옛 금액)
+        el("td", { class: "r num", style: "font-weight:600" }, [
+          (e.currency !== "KRW" && !stepAt(e, periodAnchor())) ? el("span", { style: "color:var(--ink-3);font-size:11px", text: CUR[e.currency] + won(e.amount) + " → " }) : null,
+          el("span", { text: money(e.mode === "monthly" ? krwAt(e, periodAnchor()) : krwTotal(e)) }),
+          (e.steps || []).length ? el("span", { class: "pill gold", style: "margin-left:6px" }, [icon("chart", 9, 2.4)]) : null
+        ].filter(Boolean))
       ]));
     });
     // 이 기간에 실제로 나간 돈 — 할부·고정은 전체 금액이 아니라 그 달 몫만 센다
@@ -1550,7 +1652,7 @@
     months.forEach(m => {
       const rows = byMonth[m].filter(e => matchEntry(e, S.q));
       if (!rows.length) return;
-      const tot = rows.reduce((s, e) => s + perMonth(e), 0);
+      const tot = rows.reduce((s, e) => s + perMonthAt(e, m), 0);
       const tb = el("tbody");
       rows.forEach(e => {
         const editable = canEdit();
@@ -1561,6 +1663,7 @@
           onclick: editable ? open : null,
           oncontextmenu: editable ? (ev => contextMenu(ev, [
             { label: "고치기", icon: "pencil", run: open },
+            { label: "복사", icon: "doc", run: () => openEntryForm({ kind: e.kind, parent: e.parent, entry: e, copy: true }) },
             { label: "지우기", icon: "eraser", danger: true, run: () => confirmSheet("지울까요?", e.title, "지우기", () => drop("entries", e.id)) }
           ])) : null
         }, [
@@ -1568,7 +1671,7 @@
         el("td", { style: "font-weight:600", text: e.title }),
         el("td", {}, [el("span", { class: "pill" + (e.kind === "card" ? " rose" : "") }, [ownerOf(e).name || "—"])]),
         el("td", {}, [statusPill(e, m) || el("span", { style: "color:var(--ink-3)", text: "—" })]),
-        el("td", { class: "r num", style: "font-weight:600", text: money(perMonth(e)) })
+        el("td", { class: "r num", style: "font-weight:600", text: money(perMonthAt(e, m)) })
         ]));
       });
       panel.append(el("div", { class: "table-wrap" }, [el("table", { style: "min-width:500px" }, [
