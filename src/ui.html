@@ -913,7 +913,7 @@
 
     const dateIn = input({ type: "date", value: e.date, onchange: ev => { e.date = ev.target.value; if (opts.kind === "card" && isNew) { e.billDate = e.date; e.billMonth = ymOf(e.date); billIn.value = e.billDate; } sync(); } });
     const titleIn = input({ value: e.title, placeholder: opts.kind === "card" ? "가맹점" : "항목", oninput: ev => { e.title = ev.target.value; } });
-    const amtIn = input({ type: "number", step: "0.01", min: "0", value: e.amount || "", placeholder: "0", oninput: ev => { e.amount = +ev.target.value || 0; sync(); } });
+    const amtIn = input({ type: "number", step: "0.01", min: "0", value: e.amount || "", placeholder: "0", oninput: ev => { e.amount = +ev.target.value || 0; syncMonthly(); sync(); } });
     // 할부에서는 이 칸이 '전체 금액'임을 이름으로 못박는다 — 월 납입은 회차로 나눠 자동 계산
     const amountBox = field("금액", amtIn);
     const amountLabel = amountBox.querySelector("label");
@@ -1013,33 +1013,61 @@
     }
     const rateBox = field("환율", input({ type: "number", step: "0.01", min: "0", value: e.rate || "", placeholder: "자동", oninput: ev => { e.rate = +ev.target.value || 0; sync(); } }));
     const curSel = select([{ v: "KRW", t: "원" }, { v: "USD", t: "$" }, { v: "CNY", t: "¥" }], e.currency, ev => { e.currency = ev.target.value; rateBox.hidden = e.currency === "KRW"; sync(); });
-    const monthsIn = input({ type: "number", min: "1", max: "120", value: e.months || 12, oninput: ev => { e.months = Math.max(1, +ev.target.value || 1); sync(); } });
+    const monthsIn = input({ type: "number", min: "1", max: "120", value: e.months || 12, oninput: ev => { e.months = Math.max(1, +ev.target.value || 1); syncMonthly(); sync(); } });
     const endIn = input({ type: "date", value: e.endDate || (e.endMonth ? e.endMonth + "-01" : ""),
       onchange: ev => { e.endDate = ev.target.value; e.endMonth = ymOf(e.endDate); sync(); } });
     // 청구일이 없던 옛 기록은 결제 기간 끝날을 먼저 쓴다 — 그게 실제 마감일이다
     const billIn = input({ type: "date", value: e.billDate || e.periodEnd || (e.billMonth ? e.billMonth + "-01" : e.date),
       onchange: ev => { e.billDate = ev.target.value; e.billMonth = ymOf(e.billDate); sync(); } });
-    /* 월 납입액은 자동(전체÷개월)과 직접 입력 사이를 언제든 오갈 수 있어야 한다.
-       칸만 두면 실수로 0 을 넣었을 때 자동으로 되돌릴 길이 안 보인다. */
-    const monthlyIn = input({ type: "number", step: "1", min: "0", value: e.monthly || "", placeholder: "자동",
-      oninput: ev => { e.monthly = +ev.target.value || 0; sync(); } });
+    /* 할부 납입액.
+       카드사는 전체를 회차로 똑같이 나누지 않고 첫 회차가 나머지를 떠안는다.
+       그래서 '첫 회차' 와 '이후 회차' 두 칸을 나란히 두고 서로 물리게 한다 —
+       한 칸만 두면 어느 쪽 금액인지 헷갈려 엉뚱한 값이 들어간다(실제로 낸 버그다).
+       저장되는 값은 `monthly` = 이후 회차 금액 하나다. */
+    const firstIn = input({ type: "number", step: "1", min: "0", oninput: ev => {
+      const n = Math.max(1, e.months || 1);
+      if (n < 2) { e.monthly = 0; return syncMonthly("first"); }
+      e.monthly = Math.round((krwTotal(e) - (+ev.target.value || 0)) / (n - 1));
+      syncMonthly("first"); sync();             // 지금 타이핑 중인 칸은 건드리지 않는다
+    } });
+    const restIn = input({ type: "number", step: "1", min: "0", oninput: ev => {
+      e.monthly = +ev.target.value || 0;
+      syncMonthly("rest"); sync();              // 지금 타이핑 중인 칸은 건드리지 않는다
+    } });
     const monthlyPick = segmented([{ v: "auto", t: "자동" }, { v: "manual", t: "직접" }],
       e.monthly ? "manual" : "auto", v => {
-        if (v === "auto") { e.monthly = 0; monthlyIn.value = ""; }
-        else if (!e.monthly) {
-          // 직접으로 바꾸면 자동 계산값을 미리 채워 준다 — 빈 칸보다 고치기 쉽다
-          e.monthly = Math.round(krwTotal(e) / Math.max(1, e.months || 1));
-          monthlyIn.value = e.monthly;
-        }
-        monthlyIn.disabled = v === "auto";
-        sync();
+        e._byHand = v === "manual";
+        if (!e._byHand) e.monthly = 0;
+        else if (!e.monthly) e.monthly = Math.round(krwTotal(e) / Math.max(1, e.months || 1));
+        syncMonthly(); sync();
       });
-    monthlyIn.disabled = !e.monthly;
+    e._byHand = !!e.monthly;
+    const monthlyWarn = el("div", { class: "hint" });
     const monthlyBox = el("div", { class: "field" }, [
-      el("label", { text: "월 납입액" }),
-      el("div", { class: "grid2", style: "gap:10px" }, [monthlyPick, monthlyIn]),
-      el("div", { class: "hint", text: "자동은 전체÷개월. 명세서에 적힌 값이 다르면 직접 넣으세요." })
+      el("label", { text: "할부금" }),
+      monthlyPick,
+      el("div", { class: "grid2", style: "gap:10px;margin-top:8px" }, [
+        el("div", { class: "field" }, [el("label", { text: "첫 회차" }), firstIn]),
+        el("div", { class: "field" }, [el("label", { text: "이후 회차" }), restIn])
+      ]),
+      monthlyWarn
     ]);
+
+    // 두 칸과 경고를 현재 상태에 맞춘다. typing 은 지금 사람이 치고 있는 칸 이름.
+    function syncMonthly(typing) {
+      const n = Math.max(1, e.months || 1), total = krwTotal(e);
+      const rest = e._byHand && e.monthly ? e.monthly : Math.round(total / n);
+      const first = n < 2 ? total : total - rest * (n - 1);
+      firstIn.disabled = restIn.disabled = !e._byHand || n < 2;
+      if (typing !== "rest") restIn.value = Math.round(rest) || "";
+      if (typing !== "first") firstIn.value = Math.round(first) || "";
+      const bad = first <= 0 || rest <= 0;
+      monthlyWarn.textContent = bad
+        ? "금액이 맞지 않아요. 첫 회차와 이후 회차가 모두 0원보다 커야 합니다."
+        : "카드사는 첫 회차에 나머지를 몰아 준다. 자동은 전체를 회차로 고르게 나눈 값이다.";
+      monthlyWarn.style.color = bad ? "var(--rose)" : "var(--ink-3)";
+      e._badSplit = bad && e.mode === "split";
+    }
     const monthsBox = field("개월", monthsIn);
     const endBox = field("끝나는 날", endIn, "비우면 계속");
 
@@ -1130,6 +1158,7 @@
     endBox.hidden = e.mode !== "monthly";
     rateBox.hidden = e.currency === "KRW";
     drawSteps();
+    syncMonthly();
     claimSync();
     sync();
 
@@ -1147,6 +1176,7 @@
         el("button", {
           class: "btn primary", onclick: async () => {
             if (!e.amount) return toast("금액을 넣어 주세요.", true);
+            if (e.mode === "split" && e._badSplit) return toast("첫 회차와 이후 회차가 모두 0원보다 커야 해요.", true);
             const txt = (e._catText || "").trim();
             if (txt) {
               const hit = S.cats.find(c => c.name === txt);
