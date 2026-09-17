@@ -463,9 +463,10 @@
   // 큰 숫자는 억·만으로 — 화면에서 자릿수 소음을 줄인다
   function brief(n) {
     const a = Math.abs(Math.round(n));
-    if (a >= 100000000) { const v = a / 100000000; return (v >= 100 ? Math.round(v).toLocaleString("ko-KR") : v.toFixed(1).replace(/\.0$/, "")) + "억"; }
-    if (a >= 10000) { const v = a / 10000; return (v >= 100 ? Math.round(v).toLocaleString("ko-KR") : v.toFixed(1).replace(/\.0$/, "")) + "만"; }
-    return won(a) + "원";
+    const sign = Math.round(n) < 0 ? "-" : "";     // 부호를 빼먹으면 -314,800 이 31.5만 으로 보인다
+    if (a >= 100000000) { const v = a / 100000000; return sign + (v >= 100 ? Math.round(v).toLocaleString("ko-KR") : v.toFixed(1).replace(/\.0$/, "")) + "억"; }
+    if (a >= 10000) { const v = a / 10000; return sign + (v >= 100 ? Math.round(v).toLocaleString("ko-KR") : v.toFixed(1).replace(/\.0$/, "")) + "만"; }
+    return sign + won(a) + "원";
   }
   const todayISO = () => new Date().toISOString().slice(0, 10);
   const ymOf = d => String(d || "").slice(0, 7);
@@ -594,6 +595,9 @@
     return ym === startMonth(e) ? total - m * (n - 1) : m;
   }
   const autoMonthly = e => e.mode === "split" ? splitSchedule(e, periodAnchor()) : krwTotal(e);
+  // 첫 회차가 0원 이하로 잡히는 할부는 잘못 적힌 것이다(이후 회차 금액이 너무 큼)
+  const brokenSplit = e => e.mode === "split" && Math.max(1, e.months || 1) > 1 &&
+    splitSchedule(e, startMonth(e)) <= 0;
 
   /* 그 달에 실제로 빠져나가는 돈.
      steps 에 적어 둔 값은 언제나 '그 달의 월 납입액'이다(할부의 전체 금액이 아니다).
@@ -2170,7 +2174,9 @@
             claimExpiring(e) ? el("span", { class: "pill rose" }, ["기한 " + claimExpiring(e) + "일"]) : null
           ].filter(Boolean)) : null,
           (e.purpose || e.memo) ? el("div", { style: "font-size:11px;color:var(--ink-3)", text: [e.purpose, e.memo].filter(Boolean).join(" · ") }) : null]),
-        el("td", {}, [catName(e.catId) ? el("span", { class: "pill" }, [catName(e.catId)]) : el("span", { style: "color:var(--ink-3)" }, ["—"])]),
+        el("td", {}, [brokenSplit(e)
+          ? el("span", { class: "pill rose" }, ["금액 확인"])
+          : catName(e.catId) ? el("span", { class: "pill" }, [catName(e.catId)]) : el("span", { style: "color:var(--ink-3)" }, ["—"])]),
         el("td", {}, [el("span", { class: "pill " + (paidByCard(e) ? "sky" : "mint") }, [icon(paidByCard(e) ? "card" : "wallet", 10, 2.2), payLabel(e)])]),
         el("td", {}, [statusPill(e) || el("span", { style: "color:var(--ink-3)", text: "—" })]),
         el("td", { class: "r num", style: "color:var(--ink-3)" }, e.mode === "once" ? ["—"] : [
