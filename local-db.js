@@ -182,8 +182,70 @@
     }
   };
 
-  // 명세서 자동 읽기는 Claude 가 있어야 한다 — 내 PC판에서는 직접 채우기로 넘어간다
+  /* 명세서 자동 읽기 — 브라우저에는 AI 가 없으므로 서버가 대신 Anthropic API 를 부른다.
+     API 열쇠는 서버 쪽 claude_key.txt 에만 있고 이 화면으로는 내려오지 않는다.
+     열쇠가 없으면 sample 은 null 이고, 화면은 '직접 채우기'로 넘어간다. */
+  function blobToBase64(b) {
+    return new Promise(function (ok, fail) {
+      var fr = new FileReader();
+      fr.onload = function () { ok(String(fr.result).split(",")[1] || ""); };
+      fr.onerror = fail;
+      fr.readAsDataURL(b);
+    });
+  }
+
+  function makeSample() {
+    function call(input, opts) {
+      var imgs = (opts && opts.images) || [];
+      imgs = imgs.length ? (imgs.length === undefined ? [imgs] : [].slice.call(imgs)) : [];
+      if (!imgs.length) {
+        return Promise.reject({ code: "images_unavailable",
+          message: "내 PC판은 그림이 있어야 읽을 수 있어요." });
+      }
+      return Promise.all(imgs.map(function (b) {
+        return blobToBase64(b).then(function (d) { return { type: b.type || "image/jpeg", data: d }; });
+      })).then(function (payload) {
+        return fetch("/api/read" + (location.search || ""), {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ prompt: typeof input === "string" ? input : JSON.stringify(input), images: payload })
+        });
+      }).then(function (r) { return r.json(); }).then(function (out) {
+        if (out.error) {
+          var code = out.error === "no_key" || out.error === "bad_key" ? "not_granted"
+            : out.error === "rate" ? "rate_limited" : "upstream_error";
+          throw { code: code, message: out.message || out.error };
+        }
+        return { text: out.text || "", truncated: false, modelTierApplied: "default" };
+      });
+    }
+    call.json = function (input, opts) {
+      return call(input, opts).then(function (res) {
+        var t = (res.text || "").trim();
+        var fence = t.match(/```(?:json)?\s*([\s\S]*?)```/);
+        if (fence) t = fence[1].trim();
+        else {
+          var a = t.indexOf("{"), b = t.lastIndexOf("}");
+          if (a >= 0 && b > a) t = t.slice(a, b + 1);
+        }
+        try { return JSON.parse(t); }
+        catch (e) { throw { code: "invalid_json", message: "표로 옮기지 못했어요.", text: res.text }; }
+      });
+    };
+    call.limits = function () {
+      return Promise.resolve({ maxPromptBytes: 65536,
+        images: { maxCount: 8, maxInputBytes: 20000000, mediaTypes: ["image/jpeg", "image/png"] } });
+    };
+    return call;
+  }
+
   window.__LOCAL__ = { db: db, downloads: downloads, sample: null };
+
+  // 열쇠가 준비돼 있으면 자동 읽기를 켠다
+  fetch("/api/read" + (location.search || ""))
+    .then(function (r) { return r.json(); })
+    .then(function (s) { if (s && s.ready) window.__LOCAL__.sample = makeSample(); })
+    .catch(function () {});
 
   pull();
   setInterval(function () { if (!dirty && !inFlight) pull(); }, POLL_MS);

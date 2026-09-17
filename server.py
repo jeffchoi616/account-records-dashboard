@@ -31,8 +31,14 @@ from urllib.parse import urlparse, parse_qs
 HERE = Path(__file__).resolve().parent
 DATA = HERE / "장부.json"
 BACKUPS = HERE / "backups"
+KEY_FILE = HERE / "claude_key.txt"          # 명세서 읽기에 쓰는 API 열쇠 (git 에 안 올라간다)
 KEEP_BACKUPS = 30
 MAX_BODY = 32 * 1024 * 1024  # 32MB — 장부 하나가 이보다 커질 일은 없다
+
+# 명세서 읽기 — 브라우저에는 AI 가 없으므로 서버가 대신 Anthropic API 를 부른다.
+CLAUDE_URL = "https://api.anthropic.com/v1/messages"
+CLAUDE_MODEL = "claude-sonnet-5"
+CLAUDE_MAX_TOKENS = 8000
 
 EMPTY = {"version": 0, "groups": {}, "cards": {}, "cats": {}, "meta": {}, "entries": {}}
 COLLECTIONS = ("groups", "cards", "cats", "meta", "entries")
@@ -92,6 +98,62 @@ def save(doc: dict) -> dict:
     return doc
 
 
+# ---------------------------------------------------------------- 명세서 읽기
+def api_key() -> str:
+    """열쇠는 파일이나 환경변수에서 읽는다. 브라우저로는 절대 내려보내지 않는다."""
+    k = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not k and KEY_FILE.exists():
+        k = KEY_FILE.read_text(encoding="utf-8").strip()
+    return k
+
+
+def ask_claude(prompt: str, images: list[dict]) -> dict:
+    """그림과 지시문을 Anthropic API 로 보내고 JSON 을 받아 온다."""
+    import urllib.request
+    import urllib.error
+
+    key = api_key()
+    if not key:
+        return {"error": "no_key", "message": "API 열쇠가 없습니다."}
+
+    content: list[dict] = []
+    for im in images[:8]:
+        content.append({
+            "type": "image",
+            "source": {"type": "base64",
+                       "media_type": im.get("type") or "image/jpeg",
+                       "data": im["data"]},
+        })
+    content.append({"type": "text", "text": prompt})
+
+    body = json.dumps({
+        "model": CLAUDE_MODEL,
+        "max_tokens": CLAUDE_MAX_TOKENS,
+        "messages": [{"role": "user", "content": content}],
+    }).encode("utf-8")
+
+    req = urllib.request.Request(CLAUDE_URL, data=body, method="POST", headers={
+        "content-type": "application/json",
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=180) as r:
+            out = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as err:
+        detail = err.read().decode("utf-8", "replace")[:400]
+        if err.code in (401, 403):
+            return {"error": "bad_key", "message": "API 열쇠가 거부됐습니다. 다시 넣어 주세요."}
+        if err.code == 429:
+            return {"error": "rate", "message": "요청이 몰렸어요. 잠시 뒤 다시 시도해 주세요."}
+        return {"error": "http_%d" % err.code, "message": detail}
+    except Exception as err:                                  # 네트워크 끊김 등
+        return {"error": "net", "message": str(err)[:300]}
+
+    text = "".join(b.get("text", "") for b in out.get("content", []) if b.get("type") == "text")
+    return {"text": text}
+
+
 # ---------------------------------------------------------------- 서버
 SAFE_NAME = re.compile(r"^[A-Za-z0-9_.\-]+$")
 SERVE = {"index.html": "text/html; charset=utf-8", "local-db.js": "text/javascript; charset=utf-8"}
@@ -142,6 +204,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/data":
             with _lock:
                 return self._json(200, load())
+        if path == "/api/read":
+            # 열쇠가 있는지만 알려 준다 — 열쇠 자체는 절대 내려보내지 않는다
+            return self._json(200, {"ready": bool(api_key()), "model": CLAUDE_MODEL})
         name = "index.html" if path in ("/", "/index.html") else path.lstrip("/")
         if name not in SERVE or not SAFE_NAME.match(name):
             return self._send(404, b"not found", "text/plain")
@@ -150,11 +215,54 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(404, b"not found", "text/plain")
         self._send(200, f.read_bytes(), SERVE[name])
 
-    # ---- PUT  (장부 저장)
+    def _body(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return None
+        if length <= 0 or length > MAX_BODY:
+            return None
+        try:
+            obj = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        return obj if isinstance(obj, dict) else None
+
+    # ---- PUT  (장부 저장 / 명세서 읽기 / 열쇠 저장)
     def do_PUT(self):
         if not self._authorised():
             return self._json(403, {"error": "forbidden"})
-        if urlparse(self.path).path != "/api/data":
+        path = urlparse(self.path).path
+
+        if path == "/api/read":
+            body = self._body()
+            if body is None:
+                return self._json(400, {"error": "bad json"})
+            imgs = body.get("images") or []
+            if not isinstance(imgs, list) or not imgs:
+                return self._json(400, {"error": "no_images", "message": "읽을 그림이 없어요."})
+            out = ask_claude(str(body.get("prompt") or ""), imgs)
+            return self._json(200, out)
+
+        if path == "/api/key":
+            body = self._body()
+            if body is None:
+                return self._json(400, {"error": "bad json"})
+            key = str(body.get("key") or "").strip()
+            try:
+                if key:
+                    KEY_FILE.write_text(key, encoding="utf-8")
+                    try:
+                        os.chmod(KEY_FILE, 0o600)
+                    except OSError:
+                        pass
+                elif KEY_FILE.exists():
+                    KEY_FILE.unlink()
+            except OSError as err:
+                return self._json(500, {"error": "save", "message": str(err)[:200]})
+            return self._json(200, {"ready": bool(api_key())})
+
+        if path != "/api/data":
             return self._json(404, {"error": "not found"})
         try:
             length = int(self.headers.get("Content-Length") or 0)

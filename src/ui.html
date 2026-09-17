@@ -248,6 +248,7 @@
     background:rgba(255,203,107,.09);border:1px solid rgba(255,203,107,.28);color:#ffe0ac
   }
   .banner .btn{margin-left:auto}
+  .banner.ok{background:rgba(95,240,197,.08);border-color:rgba(95,240,197,.28);color:#bff3e2}
 
   /* ---------- modal ---------- */
   .scrim{
@@ -490,7 +491,7 @@
     view: { type: "dash" }, year: +NOW_YM.slice(0, 4), month: NOW_YM, q: "",
     groups: [], cards: [], cats: [], entries: [],
     rates: { base: { USD: 1380, CNY: 192 } },
-    db: null, sample: null, downloads: null, imagesOK: false,
+    db: null, sample: null, downloads: null, imagesOK: false, imageLimits: null,
     loaded: false, railOpen: false
   };
   // 편집은 PC 에서만. 창 너비가 아니라 입력 장치로 가른다 —
@@ -572,20 +573,33 @@
     return left < 90 ? left : 0;
   }
 
-  // 할부의 자동 월 납입액 — 전체 금액을 회차로 나눈 값. 이자는 여기에 얹힌다.
-  const autoMonthly = e => e.mode === "split" ? krwTotal(e) / Math.max(1, e.months || 1) : krwTotal(e);
+  /* 할부의 '예정 납입액' — 그 달에 내기로 되어 있는 원금.
+
+     카드사는 전체 금액을 회차로 똑같이 나누지 않는다. 월 납입액을 떨어지는 숫자로
+     잡고 **첫 회차가 나머지를 떠안는다.** 실제 명세서로 확인한 규칙이다.
+       현대리바트 2,599,100 / 12개월, 월 212,200
+         → 첫 회차 2,599,100 − 212,200×11 = 264,900, 이후 11회 212,200  (합 2,599,100)
+     그래서 월 납입액(`monthly`)을 알면 그것이 기준이고, 모르면 균등 분할로 어림한다. */
+  function splitSchedule(e, ym) {
+    const total = krwTotal(e), n = Math.max(1, e.months || 1);
+    const m = +e.monthly || 0;
+    if (!m || n < 2) return total / n;
+    return ym === startMonth(e) ? total - m * (n - 1) : m;
+  }
+  const autoMonthly = e => e.mode === "split" ? splitSchedule(e, periodAnchor()) : krwTotal(e);
 
   /* 그 달에 실제로 빠져나가는 돈.
      steps 에 적어 둔 값은 언제나 '그 달의 월 납입액'이다(할부의 전체 금액이 아니다).
-     적어 둔 값이 있으면 그것이 먼저고, 없으면 자동 계산값을 쓴다. */
+     적어 둔 값이 있으면 그것이 먼저고, 없으면 예정 납입액을 쓴다. */
   function perMonthAt(e, ym) {
     const s = stepAt(e, ym);
-    return s ? stepKrw(s) : autoMonthly(e);
+    if (s) return stepKrw(s);
+    return e.mode === "split" ? splitSchedule(e, ym) : krwTotal(e);
   }
-  // 자동 계산보다 더 낸 돈 = 이자. 할부에서만 뜻이 있다.
+  // 예정보다 더 낸 돈 = 이자. 할부에서만 뜻이 있다.
   function interestAt(e, ym) {
     if (e.mode !== "split") return 0;
-    return Math.max(0, perMonthAt(e, ym) - autoMonthly(e));
+    return Math.max(0, perMonthAt(e, ym) - splitSchedule(e, ym));
   }
   const periodInterest = list => list.reduce((s, e) => s + periodMonths(e).reduce((t, m) => t + interestAt(e, m), 0), 0);
   // 지금 보고 있는 기간 기준 — 화면에 한 줄로 보여 줄 때 쓴다
@@ -858,7 +872,7 @@
     const e = Object.assign({
       id: uid(), kind: opts.kind, parent: opts.parent, date: todayISO(), title: "",
       amount: 0, currency: "KRW", rate: 0, catId: "", purpose: "", memo: "",
-      mode: opts.kind === "card" ? "once" : "split", months: 12, endMonth: "",
+      mode: opts.kind === "card" ? "once" : "split", months: 12, monthly: 0, endMonth: "",
       billMonth: ymOf(todayISO()), billDate: "", endDate: "", periodStart: "", periodEnd: "",
       pay: "cash", payCard: "", steps: []
     }, opts.entry || {});
@@ -994,6 +1008,9 @@
     // 청구일이 없던 옛 기록은 결제 기간 끝날을 먼저 쓴다 — 그게 실제 마감일이다
     const billIn = input({ type: "date", value: e.billDate || e.periodEnd || (e.billMonth ? e.billMonth + "-01" : e.date),
       onchange: ev => { e.billDate = ev.target.value; e.billMonth = ymOf(e.billDate); sync(); } });
+    const monthlyIn = input({ type: "number", step: "1", min: "0", value: e.monthly || "", placeholder: "자동",
+      oninput: ev => { e.monthly = +ev.target.value || 0; sync(); } });
+    const monthlyBox = field("월 납입액", monthlyIn, "명세서에 적힌 값. 비우면 전체÷개월");
     const monthsBox = field("개월", monthsIn);
     const endBox = field("끝나는 날", endIn, "비우면 계속");
 
@@ -1031,14 +1048,23 @@
       changeBox.hidden = !amountMoved();
       amountLabel.textContent = e.mode === "split" ? "전체 금액" : "금액";
       if (e.mode === "split") {
-        const s = startMonth(e), last = addMonths(s, Math.max(1, e.months) - 1);
-        const auto = total / Math.max(1, e.months);
-        // 달별로 적어 둔 금액이 있으면 그것이 자동 계산을 덮는다 — 안 보이면 "왜 안 바뀌지"가 된다
+        const s = startMonth(e), n = Math.max(1, e.months), last = addMonths(s, n - 1);
+        const m = +e.monthly || 0;
+        const first = (m && n > 1) ? total - m * (n - 1) : total / n;
+        const rest = (m && n > 1) ? m : total / n;
         const covering = stepAt(e, anchorYm);
         setKids(preview,
-          el("span", { text: `자동 월 ${money(auto)} · ${dot(s)} ~ ${dot(last)}` + (last < NOW_YM ? " · 완납" : ` · 지금 ${Math.min(Math.max(seqAt(e, NOW_YM), 1), e.months)}/${e.months}회차`) }),
+          el("span", { text: (m && n > 1)
+            ? `첫 회차 ${money(first)} · 이후 ${n - 1}회 ${money(rest)}`
+            : `자동 월 ${money(rest)}` }),
+          el("span", { style: "color:var(--ink-3);margin-left:8px",
+            text: `${dot(s)} ~ ${dot(last)}` + (last < NOW_YM ? " · 완납" : ` · 지금 ${Math.min(Math.max(seqAt(e, NOW_YM), 1), n)}/${n}회차`) }),
+          // 첫 회차가 나머지를 떠안으므로 합이 전체와 맞는지 바로 보여 준다
+          (m && n > 1) ? el("div", { style: "margin-top:4px;color:var(--ink-3)" },
+            [`합계 ${money(first + rest * (n - 1))}` + (Math.abs(first + rest * (n - 1) - total) < 1 ? " — 전체 금액과 맞아요" : " — 전체 금액과 어긋나요")]) : null,
+          // 달별로 적어 둔 금액이 있으면 그것이 예정 납입액을 덮는다 — 안 보이면 "왜 안 바뀌지"가 된다
           covering ? el("div", { style: "color:var(--gold);margin-top:4px" },
-            [`${dot(anchorYm)} 은 따로 적어 둔 ${money(stepKrw(covering))} 으로 잡힙니다 — 자동 계산으로 되돌리려면 아래 금액 이력을 지우세요`]) : null
+            [`${dot(anchorYm)} 은 따로 적어 둔 ${money(stepKrw(covering))} 으로 잡힙니다 — 되돌리려면 아래 금액 이력을 지우세요`]) : null
         );
         drawSteps();
       } else if (e.mode === "monthly") {
@@ -1053,9 +1079,10 @@
       fxLine,
       el("div", { class: "grid2" }, [
         field("방식", segmented([{ v: "once", t: "일시불" }, { v: "split", t: "할부" }, { v: "monthly", t: "매달" }], e.mode,
-          v => { e.mode = v; monthsBox.hidden = v !== "split"; endBox.hidden = v !== "monthly"; sync(); })),
+          v => { e.mode = v; monthsBox.hidden = v !== "split"; monthlyBox.hidden = v !== "split"; endBox.hidden = v !== "monthly"; sync(); })),
         monthsBox
       ]),
+      monthlyBox,
       endBox, preview, changeBox, stepList,
       opts.kind === "card" ? el("div", { class: "grid3" }, [
         field("청구일", billIn, "이 날이 든 달로 잡힌다"),
@@ -1070,6 +1097,7 @@
     ].filter(Boolean);
 
     monthsBox.hidden = e.mode !== "split";
+    monthlyBox.hidden = e.mode !== "split";
     endBox.hidden = e.mode !== "monthly";
     rateBox.hidden = e.currency === "KRW";
     drawSteps();
@@ -1114,6 +1142,7 @@
               amount: saveAmount, currency: saveCur, rate: saveRate, steps: steps, catId: e.catId,
               purpose: e.purpose || "", memo: e.memo || "", mode: e.mode,
               months: e.mode === "split" ? Math.max(1, e.months) : 1,
+              monthly: e.mode === "split" ? (+e.monthly || 0) : 0,
               endMonth: e.mode === "monthly" ? (e.endMonth || "") : "",
               endDate: e.mode === "monthly" ? (e.endDate || "") : "",
               billMonth: e.kind === "card" ? (e.billMonth || ymOf(e.billDate || e.date)) : "",
@@ -1260,26 +1289,261 @@
     });
   }
 
-  /* ========================== 명세서 읽기 ========================== */
-  async function pdfText(file) {
+  /* ========================== 명세서 읽기 ==========================
+     명세서는 표다. 글자를 한 줄로 뭉쳐 보내면 어느 금액이 어느 가맹점 것인지
+     알 길이 없어 엉뚱하게 읽힌다. 그래서 두 가지를 같이 보낸다.
+       ① 줄과 칸을 살린 글자 — 좌표로 같은 줄을 묶고 칸 사이를 탭으로 벌린다
+       ② 페이지를 그대로 그린 그림 — 표는 눈으로 보는 쪽이 훨씬 정확하다
+     글자가 아예 없는(스캔한) 명세서도 ②로 읽힌다. */
+  const PDF_MAX_PAGES = 6;
+
+  /* 카드사가 메일로 보내는 명세서는 대개 비밀번호가 걸려 있다(생년월일·주민번호 앞자리 등).
+     비밀번호가 필요하면 물어보고 다시 연다. */
+  async function openPdf(file, askPassword) {
     if (!window.pdfjsLib) throw new Error("no pdfjs");
     try { window.pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js"; } catch (_) {}
-    const doc = await window.pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
+    const data = await file.arrayBuffer();
+    let password;
+    for (let tries = 0; tries < 4; tries++) {
+      try {
+        return await window.pdfjsLib.getDocument(
+          password === undefined ? { data: data.slice(0) } : { data: data.slice(0), password }
+        ).promise;
+      } catch (err) {
+        const needs = err && (err.name === "PasswordException" || /password/i.test(err.message || ""));
+        if (!needs || !askPassword) throw err;
+        password = await askPassword(file.name, tries > 0);
+        if (!password) throw Object.assign(new Error("password cancelled"), { cancelled: true });
+      }
+    }
+    throw new Error("password failed");
+  }
+
+  function askPdfPassword(name, retry) {
+    return new Promise(resolve => {
+      const pw = input({ type: "password", placeholder: "명세서 비밀번호", autocomplete: "off" });
+      const m = modal({
+        title: "비밀번호가 걸린 명세서",
+        body: [
+          el("p", { style: "margin:0;color:var(--ink-2);font-size:13px;line-height:1.7" },
+            [retry ? "비밀번호가 맞지 않아요. 다시 넣어 주세요." : name + " 는 비밀번호로 잠겨 있어요."]),
+          field("비밀번호", pw, "카드사가 안내한 번호 (생년월일 6자리 등)")
+        ],
+        foot: [
+          el("button", { class: "btn quiet", onclick: () => { m.close(); resolve(""); } }, ["취소"]),
+          el("button", { class: "btn primary", onclick: () => { const v = pw.value; m.close(); resolve(v); } }, ["열기"])
+        ]
+      });
+      pw.addEventListener("keydown", ev => { if (ev.key === "Enter") { const v = pw.value; m.close(); resolve(v); } });
+    });
+  }
+
+  /* pdf.js 가 돌려준 글자가 쓸모 있는지 본다. 한국 카드사 PDF 는 글꼴에 유니코드 표가
+     없어 네모·빈 글자만 나오는 일이 흔하다. 그런 글자는 보내 봐야 해만 된다. */
+  function textLooksUsable(t) {
+    if (!t) return false;
+    const body = t.replace(/\s/g, "");
+    if (body.length < 40) return false;
+    const digits = (body.match(/\d/g) || []).length;
+    const readable = (body.match(/[0-9A-Za-z가-힣]/g) || []).length;
+    return digits >= 8 && readable / body.length > 0.5;    // 금액·날짜가 숫자로 잡혀야 쓸모가 있다
+  }
+
+  // 표 모양을 살린 글자 추출
+  async function pdfLayoutText(doc) {
     let out = "";
-    for (let p = 1; p <= Math.min(doc.numPages, 12); p++) {
-      const tc = await (await doc.getPage(p)).getTextContent();
-      out += tc.items.map(i => i.str).join(" ") + "\n";
+    const pages = Math.min(doc.numPages, PDF_MAX_PAGES);
+    for (let p = 1; p <= pages; p++) {
+      const page = await doc.getPage(p);
+      const tc = await page.getTextContent();
+      const rows = new Map();
+      tc.items.forEach(it => {
+        if (!it.str || !it.str.trim()) return;
+        const y = Math.round(it.transform[5] / 4);          // 4pt 안쪽은 같은 줄로 본다
+        const x = it.transform[4];
+        if (!rows.has(y)) rows.set(y, []);
+        rows.get(y).push({ x, w: it.width || 0, s: it.str });
+      });
+      [...rows.entries()].sort((a, b) => b[0] - a[0]).forEach(([, items]) => {
+        items.sort((a, b) => a.x - b.x);
+        let line = "", end = null;
+        items.forEach(it => {
+          if (end !== null) line += (it.x - end > 8) ? "\t" : (/\s$/.test(line) ? "" : " ");
+          line += it.s;
+          end = it.x + it.w;
+        });
+        if (line.trim()) out += line.trimEnd() + "\n";
+      });
+      out += "\n";
+    }
+    return out;
+  }
+
+  /* 페이지를 그림으로 — 보내기 전 1.2메가픽셀쯤으로 맞춘다(그 위는 어차피 줄여서 보낸다).
+     pdf.js 는 그리는 도중 requestAnimationFrame 으로 숨을 돌리는데, 창이 가려져 있으면
+     그게 영영 안 돌아와 멈춘다. 그래서 페이지마다 제한시간을 두고, 못 그리면 조용히
+     글자만 가지고 간다 — 멈춘 채로 사용자를 기다리게 두지 않는다. */
+  const PDF_RENDER_MS = 12000;
+  const PDF_TARGET_PX = 1200000;     // 보내기 전 이만큼으로 줄인다(그 위는 어차피 줄여서 간다)
+
+  const raceTimeout = (promise, ms) => {
+    let t;
+    return Promise.race([
+      Promise.resolve(promise).then(v => { clearTimeout(t); return v; }, () => { clearTimeout(t); return null; }),
+      new Promise(r => { t = setTimeout(() => r(null), ms); })
+    ]);
+  };
+
+  function blobFromCanvas(c) { return new Promise(r => c.toBlob(r, "image/jpeg", 0.85)); }
+
+  // pdf.js 가 건네준 그림을 캔버스에 옮겨 담는다 (bitmap 이면 그대로, 아니면 화소를 옮긴다)
+  async function imageToBlob(img) {
+    const k = Math.min(1, Math.sqrt(PDF_TARGET_PX / Math.max(1, img.width * img.height)));
+    const w = Math.max(1, Math.round(img.width * k)), h = Math.max(1, Math.round(img.height * k));
+    const c = document.createElement("canvas");
+    c.width = w; c.height = h;
+    const ctx = c.getContext("2d");
+    ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, w, h);
+    if (img.bitmap) ctx.drawImage(img.bitmap, 0, 0, w, h);
+    else if (img.data) {
+      const tmp = document.createElement("canvas");
+      tmp.width = img.width; tmp.height = img.height;
+      const td = tmp.getContext("2d"), id = td.createImageData(img.width, img.height);
+      const comps = img.data.length / (img.width * img.height);
+      for (let q = 0, s = 0; q < id.data.length; q += 4, s += comps) {
+        id.data[q] = img.data[s];
+        id.data[q + 1] = img.data[s + (comps > 1 ? 1 : 0)];
+        id.data[q + 2] = img.data[s + (comps > 2 ? 2 : 0)];
+        id.data[q + 3] = 255;
+      }
+      td.putImageData(id, 0, 0);
+      ctx.drawImage(tmp, 0, 0, w, h);
+      tmp.width = tmp.height = 0;
+    } else return null;
+    const blob = await blobFromCanvas(c);
+    c.width = c.height = 0;
+    return blob;
+  }
+
+  /* 페이지를 그림 한 장으로.
+     ① 스캔한 명세서는 페이지 자체가 그림 한 장이다 — 그 그림을 바로 꺼낸다.
+        pdf.js 의 render() 는 그리는 도중 브라우저에 숨을 돌리는데 그게 돌아오지 않아
+        멈추는 일이 있다(실제로 겪었다). 그림을 바로 꺼내면 그 길을 아예 지나지 않는다.
+     ② 그림이 아닌 보통 PDF 는 어쩔 수 없이 그린다 — 대신 제한시간을 둔다. */
+  async function pdfPageBlob(page) {
+    try {
+      const ops = await page.getOperatorList();
+      const names = [];
+      ops.fnArray.forEach((fn, i) => {
+        if (fn === window.pdfjsLib.OPS.paintImageXObject) {
+          const a = ops.argsArray[i][0];
+          if (typeof a === "string") names.push(a);
+        }
+      });
+      if (names.length === 1) {
+        const img = await raceTimeout(new Promise(r => page.objs.get(names[0], r)), PDF_RENDER_MS);
+        if (img && (img.bitmap || img.data)) {
+          const blob = await imageToBlob(img);
+          if (blob) return blob;
+        }
+      }
+    } catch (_) { /* 아래 그리기로 넘어간다 */ }
+
+    const base = page.getViewport({ scale: 1 });
+    const scale = Math.min(3, Math.max(1, Math.sqrt(PDF_TARGET_PX / Math.max(1, base.width * base.height))));
+    const vp = page.getViewport({ scale });
+    const c = document.createElement("canvas");
+    c.width = Math.round(vp.width); c.height = Math.round(vp.height);
+    const ctx = c.getContext("2d");
+    ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height);   // 투명 배경이면 글자가 안 보인다
+    const task = page.render({ canvasContext: ctx, viewport: vp });
+    const ok = await raceTimeout(task.promise.then(() => true), PDF_RENDER_MS);
+    if (!ok) { try { task.cancel(); } catch (_) {} c.width = c.height = 0; return null; }
+    const blob = await blobFromCanvas(c);
+    c.width = c.height = 0;
+    return blob;
+  }
+
+  async function pdfImages(doc, maxCount) {
+    const out = [];
+    const pages = Math.min(doc.numPages, PDF_MAX_PAGES, maxCount || PDF_MAX_PAGES);
+    for (let p = 1; p <= pages; p++) {
+      const blob = await pdfPageBlob(await doc.getPage(p));
+      if (!blob) break;                          // 한 장이 막히면 나머지도 막힌다
+      out.push(blob);
     }
     return out;
   }
 
   const READ_PROMPT = [
-    "한국 신용카드 명세서를 장부로 옮긴다. JSON 하나만 답하고 설명은 쓰지 마라.",
-    '{"periodStart":"YYYY-MM-DD"|null,"periodEnd":"YYYY-MM-DD"|null,"rows":[{"date":"YYYY-MM-DD","title":"가맹점","amount":숫자,"currency":"KRW"|"USD"|"CNY","installmentMonths":정수,"category":"짧은 구분"}]}',
-    "amount 는 쉼표·기호 없는 숫자. 일시불이면 installmentMonths 는 1.",
-    "periodStart/periodEnd 는 이용기간·결제기간(예: 6월5일~7월4일). 없으면 null.",
-    "합계·수수료·포인트·전월이월 줄은 넣지 마라. category 는 내용을 보고 2~4글자로."
+    "너는 한국 신용카드 명세서를 가계 장부로 옮기는 일을 한다. 표의 한 줄이 결제 하나다.",
+    "첨부한 그림이 명세서 원본이고, 아래 글자는 같은 명세서에서 뽑은 것이다(탭은 칸 구분).",
+    "둘이 어긋나면 그림을 믿어라. 한 줄도 빠뜨리지 말고, 없는 줄을 지어내지도 마라.",
+    "",
+    "JSON 하나만 답한다. 설명·인사·코드펜스 없이 값만:",
+    '{"periodStart":"YYYY-MM-DD"|null,"periodEnd":"YYYY-MM-DD"|null,"payDate":"YYYY-MM-DD"|null,',
+    ' "rows":[{"date":"YYYY-MM-DD","title":"가맹점명","amount":숫자,"currency":"KRW"|"USD"|"CNY",',
+    '          "installmentMonths":정수,"installmentSeq":정수|null,"monthlyAmount":숫자|null,"category":"짧은 구분"}]}',
+    "",
+    "[읽는 법]",
+    "· 칸 이름은 카드사마다 다르다. 날짜=이용일자·거래일자·승인일자, 가맹점=가맹점명·이용가맹점·내용,",
+    "  금액=이용금액·거래금액·승인금액·이용대금. 청구금액/결제금액 칸이 따로 있으면 이용금액 쪽을 쓴다.",
+    "· 날짜가 '09.05' 나 '9/5' 처럼 연도 없이 나오면 이용기간에서 연도를 짐작해 채운다.",
+    "· 할부는 '3개월', '3회차', '2/6', '할부 6' 처럼 적힌다. installmentMonths 는 전체 개월,",
+    "  installmentSeq 는 지금 몇 회차인지. 일시불·체크승인이면 installmentMonths 는 1, seq 는 null.",
+    "· 할부 줄에 '이달 원금'·'청구원금'처럼 이 달 낼 금액이 따로 적혀 있으면 monthlyAmount 에 넣어라.",
+    "  amount 는 물건값 전체(이용금액)다. 둘을 바꿔 넣지 마라. 없으면 monthlyAmount 는 null.",
+    "· amount 는 쉼표·원·₩ 없는 숫자만. 해외 결제는 원화 환산액이 아니라 현지 통화 금액과 통화를 쓴다.",
+    "· 취소·환불 줄(금액 앞 −, '취소', '매입취소')은 아예 빼라. 원결제 줄도 같이 취소됐으면 둘 다 뺀다.",
+    "· 넣지 말 것: 합계·소계·청구금액·전월이월·이자·연회비·수수료·포인트·할인·마일리지·안내문구.",
+    "· periodStart/periodEnd 는 '이용기간·결제기간·이용내역 기간'(예: 2026.07.29 ~ 2026.08.28).",
+    "· payDate 는 이 명세서의 '결제일·출금일·納부일'(예: 2026-09-10). 이용기간 끝날과 다른 날이다.",
+    "  못 찾으면 null. 셋 다 못 찾으면 셋 다 null.",
+    "· category 는 가맹점 이름을 보고 2~4글자로 (식비·생활비·교통·의료·쇼핑·문화·통신 …).",
+    "",
+    '예: {"periodStart":"2026-07-29","periodEnd":"2026-08-28","payDate":"2026-09-10","rows":[',
+    '  {"date":"2026-08-11","title":"쿠팡","amount":38900,"currency":"KRW","installmentMonths":1,"installmentSeq":null,"category":"생활비"},',
+    '  {"date":"2026-08-03","title":"현대리바트","amount":2544000,"currency":"KRW","installmentMonths":12,"installmentSeq":1,"category":"가구"}]}'
   ].join("\n");
+
+  /* 내 PC판에서 명세서를 읽으려면 Claude 열쇠가 하나 있어야 한다.
+     열쇠는 서버 쪽 파일(claude_key.txt)에만 저장되고 이 화면으로는 다시 내려오지 않는다. */
+  function openKeyForm() {
+    const keyIn = input({ type: "password", placeholder: "sk-ant-...", autocomplete: "off" });
+    const out = el("div", { class: "hint" });
+    const m = modal({
+      title: "Claude 열쇠",
+      body: [
+        el("p", { style: "margin:0;color:var(--ink-2);font-size:13px;line-height:1.75" }, [
+          "명세서를 읽으려면 Claude 열쇠가 필요해요. ",
+          el("b", { text: "console.anthropic.com" }),
+          " 에서 API key 를 만들어 붙여 넣으면 됩니다. 한 번만 넣으면 돼요."
+        ]),
+        field("열쇠", keyIn, "이 PC 의 claude_key.txt 에만 저장됩니다"),
+        out
+      ],
+      foot: [
+        el("button", { class: "btn quiet", onclick: () => m.close() }, ["취소"]),
+        el("button", {
+          class: "btn primary", onclick: async () => {
+            const v = keyIn.value.trim();
+            if (!v) return toast("열쇠를 넣어 주세요.", true);
+            out.textContent = "확인하는 중…";
+            try {
+              const r = await fetch("/api/key" + (location.search || ""), {
+                method: "PUT", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ key: v })
+              });
+              const j = await r.json();
+              if (!j.ready) throw new Error("no");
+              S.sample = null;                      // 다음에 누를 때 다시 잡는다
+              m.close(); toast("열쇠를 넣었어요. 이제 명세서를 읽을 수 있어요.");
+            } catch (_) { out.textContent = "저장하지 못했어요. 다시 시도해 주세요."; }
+          }
+        }, ["저장"])
+      ]
+    });
+  }
 
   function openStatementReader(cardId) {
     if (!canEdit()) return toast("모바일에서는 보기만 돼요.");
@@ -1317,36 +1581,101 @@
         amount: Math.abs(+(r && r.amount) || 0),
         currency: ["KRW", "USD", "CNY"].includes(r && r.currency) ? r.currency : "KRW",
         months: Math.max(1, Math.min(60, Math.round(+(r && r.installmentMonths) || 1))),
+        seq: Math.max(1, Math.min(60, Math.round(+(r && r.installmentSeq) || 1))),
+        monthly: Math.max(0, Math.round(+(r && r.monthlyAmount) || 0)),
         category: String((r && r.category) || "").slice(0, 12)
       })).filter(r => r.amount > 0);
       return {
         periodStart: /^\d{4}-\d{2}-\d{2}$/.test(d && d.periodStart) ? d.periodStart : "",
         periodEnd: /^\d{4}-\d{2}-\d{2}$/.test(d && d.periodEnd) ? d.periodEnd : "",
+        payDate: /^\d{4}-\d{2}-\d{2}$/.test(d && d.payDate) ? d.payDate : "",
         rows
       };
     }
 
     const readBtn = el("button", { class: "btn primary", disabled: "disabled", onclick: run }, [icon("spark", 15), "읽기"]);
+    const step = t => status.replaceChildren(el("div", { class: "thinking" }, [el("span", { class: "pulse" }), t]));
+
     async function run() {
-      if (!S.sample) { toast("여기서는 자동 읽기를 못 써요. 직접 채워 주세요.", true); parsed = normalize({}); return renderReview(); }
+      if (!S.sample) S.sample = await useCap("sample");          // 늦게 준비될 수 있다
+      if (S.sample && S.sample.limits && !S.imageLimits) {
+        const l = await S.sample.limits().catch(() => null);
+        S.imagesOK = !!(l && l.images); S.imageLimits = (l && l.images) || null;
+      }
+      if (!S.sample) {
+        status.replaceChildren(el("div", { class: "banner" }, [
+          "자동 읽기를 쓰려면 Claude 열쇠가 필요해요.",
+          window.__LOCAL__ ? el("button", { class: "btn sm", onclick: openKeyForm }, ["열쇠 넣기"]) : null
+        ].filter(Boolean)));
+        parsed = normalize({}); return renderReview();
+      }
       readBtn.disabled = true;
-      status.replaceChildren(el("div", { class: "thinking" }, [el("span", { class: "pulse" }), "읽는 중…"]));
       try {
-        const imgs = files.filter(f => /^image\//.test(f.type));
+        const maxImg = (S.imageLimits && S.imageLimits.maxCount) || 5;
+        const imgs = files.filter(f => /^image\//.test(f.type)).slice(0, maxImg);
         const pdfs = files.filter(f => /pdf$/i.test(f.type) || /\.pdf$/i.test(f.name));
-        let text = "";
-        for (const p of pdfs) { try { text += "\n" + (await pdfText(p)); } catch (_) { toast(p.name + " 글자를 못 읽었어요. 캡처를 넣어 보세요.", true); } }
-        const opts = { modelTier: "default", cache: false };
-        if (imgs.length && S.imagesOK) opts.images = imgs.slice(0, 5);
-        parsed = normalize(await S.sample.json(READ_PROMPT + (text.trim() ? "\n\n[본문]\n" + text.slice(0, 18000) : "\n\n[명세서는 첨부 이미지에 있다]"), opts));
-        status.replaceChildren();
+        let text = "", shots = imgs.slice();
+        const notes = [];
+
+        /* 그림이 먼저다. 한국 카드사 PDF 는 글꼴에 유니코드 표가 없어 글자가 네모로
+           나오는 일이 흔해서, pdf.js 글자만 믿으면 아무것도 못 읽는다. 페이지를 그려
+           눈으로 읽게 하고, 글자는 쓸 만할 때만 곁들인다. */
+        for (const p of pdfs) {
+          try {
+            step(p.name + " 여는 중…");
+            const doc = await openPdf(p, askPdfPassword);
+
+            if (!S.imagesOK) notes.push("이 화면에서는 그림 읽기를 못 써요");
+            else if (shots.length < maxImg) {
+              step(p.name + " 그림으로 옮기는 중… (" + Math.min(doc.numPages, PDF_MAX_PAGES) + "쪽)");
+              const had = shots.length;
+              shots = shots.concat(await pdfImages(doc, maxImg - shots.length));
+              if (shots.length === had) notes.push("그림을 그리지 못했어요");
+            }
+
+            step(p.name + " 글자 뽑는 중…");
+            const t = await pdfLayoutText(doc);
+            if (textLooksUsable(t)) text += "\n" + t;
+            else if (!shots.length) notes.push("글자를 알아볼 수 없는 PDF 예요");
+          } catch (err) {
+            console.warn("pdf", err);
+            if (err && err.cancelled) { readBtn.disabled = false; status.replaceChildren(); parsed = normalize({}); return renderReview(); }
+            notes.push(p.name + " 을 열지 못했어요");
+          }
+        }
+
+        if (!shots.length && !text.trim()) {
+          status.replaceChildren(el("div", { class: "banner" }, [
+            (notes.join(" · ") || "이 파일에서 읽을 내용을 찾지 못했어요") +
+            ". 명세서를 화면에 띄워 캡처한 사진(PNG·JPG)을 넣으면 잘 읽혀요."
+          ]));
+          readBtn.disabled = false;
+          parsed = normalize({}); return renderReview();
+        }
+
+        step(`읽는 중… 그림 ${shots.length}장 · 글자 ${text.replace(/\s/g, "").length}자 · 20초쯤`);
+        const opts = { modelTier: "complex", cache: false };   // 표 읽기는 정확도가 우선이다
+        if (shots.length) opts.images = shots;
+        const body = text.trim()
+          ? "\n\n[명세서에서 뽑은 글자 — 탭은 칸 구분. 그림과 어긋나면 그림을 믿어라]\n" + text.slice(0, 40000)
+          : "\n\n[글자는 못 뽑았다. 첨부한 그림만 보고 읽어라]";
+        parsed = normalize(await S.sample.json(READ_PROMPT + body, opts));
+        // 무엇을 가지고 읽었는지 남겨 둔다 — 안 맞을 때 어디가 문제인지 보이게
+        const tally = `그림 ${shots.length}장 · 글자 ${text.replace(/\s/g, "").length}자 → ${parsed.rows.length}줄`;
+        status.replaceChildren(el("div", { class: "banner" + (parsed.rows.length ? " ok" : "") }, [
+          tally + (notes.length ? " · " + notes.join(" · ") : "") +
+          (parsed.rows.length ? "" : " · 한 줄도 못 읽었어요. 캡처 사진을 넣어 보세요.")
+        ]));
         renderReview();
       } catch (err) {
         const c = err && err.code;
         status.replaceChildren(el("div", { class: "banner" }, [
           c === "not_granted" ? "Claude 사용을 허용하지 않아 직접 채우기로 넘어갑니다."
             : c === "rate_limited" ? "요청이 몰렸어요. 잠시 뒤 다시 하거나 직접 채워 주세요."
-            : "읽지 못했어요. 더 선명한 캡처로 다시 하거나 직접 채워 주세요."
+            : c === "image_rejected" ? "그림이 너무 크거나 형식이 안 맞아요. 캡처를 다시 넣어 주세요."
+            : c === "prompt_too_large" ? "명세서가 너무 길어요. 필요한 쪽만 캡처해 넣어 주세요."
+            : c === "invalid_json" ? "표로 옮기지 못했어요. 다시 눌러 보시거나 직접 채워 주세요."
+            : "읽지 못했어요. 다시 하거나 직접 채워 주세요."
         ]));
         readBtn.disabled = false;
         parsed = normalize({}); renderReview();
@@ -1356,7 +1685,9 @@
     const saveBtn = el("button", { class: "btn primary", hidden: "hidden", disabled: "disabled" }, ["장부에 넣기"]);
     function renderReview() {
       reviewBox.replaceChildren();
-      const bill = { date: parsed.periodEnd || "", ym: parsed.periodEnd ? ymOf(parsed.periodEnd) : "" };
+      // 청구일은 명세서에 적힌 결제일이 먼저다. 없으면 이용기간 끝날로 둔다.
+      const billSeed = parsed.payDate || parsed.periodEnd || "";
+      const bill = { date: billSeed, ym: billSeed ? ymOf(billSeed) : "" };
       const warn = el("div", { class: "banner" }, ["결제 기간을 못 찾았어요. 어느 달 청구인지 정해야 해서, 기간을 넣어 주세요."]);
       warn.hidden = !!parsed.periodEnd;
 
@@ -1372,11 +1703,13 @@
           el("td", {}, [input({ value: r.title, oninput: ev => { r.title = ev.target.value; } })]),
           el("td", { class: "r" }, [input({ type: "number", step: "0.01", value: r.amount, oninput: ev => { r.amount = +ev.target.value || 0; sync(); } })]),
           el("td", {}, [select([{ v: "KRW", t: "원" }, { v: "USD", t: "$" }, { v: "CNY", t: "¥" }], r.currency, ev => { r.currency = ev.target.value; sync(); })]),
-          el("td", { class: "r" }, [input({ type: "number", min: "1", value: r.months, oninput: ev => { r.months = Math.max(1, +ev.target.value || 1); } })]),
+          el("td", { class: "r" }, [input({ type: "number", min: "1", value: r.months, oninput: ev => { r.months = Math.max(1, +ev.target.value || 1); sync(); } })]),
+          el("td", { class: "r" }, [input({ type: "number", min: "1", value: r.seq, oninput: ev => { r.seq = Math.max(1, +ev.target.value || 1); sync(); } })]),
+          el("td", { class: "r" }, [input({ type: "number", min: "0", value: r.monthly || "", placeholder: "자동", oninput: ev => { r.monthly = Math.max(0, +ev.target.value || 0); sync(); } })]),
           el("td", {}, [input({ value: r.category, placeholder: "구분", oninput: ev => { r.category = ev.target.value; } })]),
           el("td", { class: "r" }, [el("button", { class: "iconbtn del", "aria-label": "빼기", onclick: () => { parsed.rows = parsed.rows.filter(x => x.id !== r.id); draw(); sync(); } }, [icon("x", 13)])])
         ])));
-        if (!parsed.rows.length) tb.append(el("tr", {}, [el("td", { colspan: "7", style: "text-align:center;color:var(--ink-3);padding:18px" }, ["＋ 로 줄을 채워 주세요"])]));
+        if (!parsed.rows.length) tb.append(el("tr", {}, [el("td", { colspan: "9", style: "text-align:center;color:var(--ink-3);padding:18px" }, ["＋ 로 줄을 채워 주세요"])]));
       }
       function sync() {
         const t = parsed.rows.reduce((s, r) => s + r.amount * (r.currency === "KRW" ? 1 : ((S.rates[ymOf(r.date)] || S.rates.base || {})[r.currency] || 1)), 0);
@@ -1392,14 +1725,14 @@
           field("청구일", billIn2)
         ]),
         el("div", { class: "table-wrap", style: "border:1px solid var(--edge);border-radius:14px" }, [
-          el("table", { class: "rev", style: "min-width:600px" }, [
+          el("table", { class: "rev", style: "min-width:780px" }, [
             el("thead", {}, [el("tr", {}, [el("th", {}, ["결제일"]), el("th", {}, ["내용"]), el("th", { class: "r" }, ["금액"]),
-              el("th", {}, ["통화"]), el("th", { class: "r" }, ["할부"]), el("th", {}, ["구분"]), el("th", {}, [""])])]),
+              el("th", {}, ["통화"]), el("th", { class: "r" }, ["개월"]), el("th", { class: "r" }, ["회차"]), el("th", { class: "r" }, ["월 납입"]), el("th", {}, ["구분"]), el("th", {}, [""])])]),
             tb
           ])
         ]),
         el("div", { style: "display:flex;gap:10px;align-items:center;flex-wrap:wrap" }, [
-          el("button", { class: "btn sm quiet", onclick: () => { parsed.rows.push({ id: uid(), date: parsed.periodEnd || todayISO(), title: "", amount: 0, currency: "KRW", months: 1, category: "" }); draw(); sync(); } }, [icon("plus", 14), "한 줄"]),
+          el("button", { class: "btn sm quiet", onclick: () => { parsed.rows.push({ id: uid(), date: parsed.periodEnd || todayISO(), title: "", amount: 0, currency: "KRW", months: 1, seq: 1, monthly: 0, category: "" }); draw(); sync(); } }, [icon("plus", 14), "한 줄"]),
           sumOut
         ])
       );
@@ -1420,8 +1753,12 @@
               amount: r.amount, currency: r.currency,
               rate: r.currency === "KRW" ? 0 : ((S.rates[ymOf(r.date)] || S.rates.base || {})[r.currency] || 1),
               catId, purpose: "", memo: "",
-              mode: r.months > 1 ? "split" : "once", months: r.months, endMonth: "",
-              billMonth: bill.ym, billDate: bill.date, endDate: "",
+              // '3/12회차' 로 잡힌 할부는 두 달 전에 시작한 것이다 — 그만큼 되돌려야
+              // 남은 회차가 맞게 퍼진다
+              mode: r.months > 1 ? "split" : "once", months: r.months,
+              monthly: r.months > 1 ? (r.monthly || 0) : 0, endMonth: "",
+              billMonth: (r.months > 1 && r.seq > 1) ? addMonths(bill.ym, -(r.seq - 1)) : bill.ym,
+              billDate: bill.date, endDate: "",
               periodStart: parsed.periodStart || "", periodEnd: parsed.periodEnd || "",
               pay: "card", payCard: card.id
             });
@@ -2252,6 +2589,7 @@
     if (S.sample && S.sample.limits) {
       const l = await S.sample.limits().catch(() => null);
       S.imagesOK = !!(l && l.images);
+      S.imageLimits = (l && l.images) || null;
     }
     S.downloads = await useCap("downloads");
     render();
