@@ -629,6 +629,10 @@
     return `${+addMonths(billYm, -1).slice(5, 7)}.${d + 1} ~ ${+billYm.slice(5, 7)}.${d}`;
   }
   const entriesOf = (kind, parent) => S.entries.filter(e => e.kind === kind && e.parent === parent);
+  /* 카드 블록은 따로 적는 장부가 아니라 "카드별로 다시 보는 창"이다.
+     기둥에 적으면서 지출 형식을 그 카드로 고른 기록이 여기에 저절로 모인다.
+     그래서 기둥 합계와 카드 합계는 서로 겹친다 — 더하면 두 번 세는 것이다. */
+  const cardEntries = id => S.entries.filter(e => { const c = payCardOf(e); return c && c.id === id; });
   const monthSum = (list, ym) => list.filter(e => monthsInYear(e, +ym.slice(0, 4)).includes(ym)).reduce((s, e) => s + perMonthAt(e, ym), 0);
 
   /* ---- 보고 있는 기간 ---------------------------------------------------
@@ -1859,17 +1863,19 @@
   }
 
   function cardTile(c) {
-    const list = entriesOf("card", c.id);
-    const bills = [...new Set(list.map(e => e.billMonth || ymOf(e.date)))].sort();
-    const last = bills[bills.length - 1];
-    const lastSum = last ? list.filter(e => (e.billMonth || ymOf(e.date)) === last).reduce((s, e) => s + krwTotal(e), 0) : 0;
-    const rows = el("div", { class: "tile-rows" }, [
-      last ? el("div", { class: "tile-row" }, [
-        el("span", { class: "t", text: cycleLabel(c, last) || dot(last) }),
-        el("span", { class: "pill sky" }, [dot(last)]),
-        el("span", { class: "num", style: "flex:none;font-weight:600", text: brief(lastSum) })
-      ]) : el("div", { class: "tile-row", style: "color:var(--ink-3)" }, [canEdit() ? "＋ 명세서 넣기" : "비어 있음"])
-    ]);
+    const list = cardEntries(c.id);
+    // 어느 기둥에서 이 카드를 썼는지 — 카드 블록은 기둥 기록을 카드별로 다시 본 것이다
+    const byPlace = {};
+    list.forEach(e => { const n = e.kind === "card" ? "직접" : (ownerOf(e).name || "기타");
+      byPlace[n] = (byPlace[n] || 0) + periodTotal(e); });
+    const top = Object.entries(byPlace).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]).slice(0, 3);
+    const rows = el("div", { class: "tile-rows" });
+    if (top.length) top.forEach(([n, v]) => rows.append(el("div", { class: "tile-row" }, [
+      el("span", { class: "t", text: n }),
+      el("span", { class: "num", style: "flex:none;font-weight:600", text: brief(v) })
+    ])));
+    else rows.append(el("div", { class: "tile-row", style: "color:var(--ink-3)" },
+      [canEdit() ? "기록에서 이 카드를 고르면 모여요" : "비어 있음"]));
     return el("button", {
       class: "tile", "data-sid": c.id, style: `--c:${c.accent || "#ff6fd8"}`,
       "aria-label": `${c.name} ${periodLabel()} ${money(periodSum(list))}`,
@@ -1922,9 +1928,11 @@
       el("div", { class: "top" }, [icon(isMonthMode() ? "clock" : "chart", 14), el("span", { text: periodLabel() + " 쪼개기" })]),
       el("div", { class: "v", text: money(total) })
     ]);
+    /* 이 막대는 "어디에 적었나"로 쪼갠 것이라 합이 곧 전체다.
+       카드로 결제한 돈은 이미 그 기둥 막대 안에 들어 있으므로 따로 더하지 않는다
+       (더하면 같은 돈을 두 번 센다). 카드별로 보는 건 아래 카드 칸이 맡는다. */
     const parts = S.groups.map(g => ({ n: g.name, c: g.accent || "#b45cff", v: periodSum(entriesOf("group", g.id)) }))
-      // 카드는 여러 장을 합친 줄이라 한 장의 색을 쓰지 않는다
-      .concat([{ n: "카드", c: "linear-gradient(90deg,#ff6fd8,#7ab8ff)", v: periodSum(S.entries.filter(e => e.kind === "card")) }])
+      .concat([{ n: "카드에 직접", c: "linear-gradient(90deg,#ff6fd8,#7ab8ff)", v: periodSum(S.entries.filter(e => e.kind === "card")) }])
       .filter(p => p.v > 0).sort((a, b) => b.v - a.v);
     const pmax = Math.max(1, ...parts.map(p => p.v));
     if (parts.length) parts.forEach(p => side.append(el("div", { class: "bar-row" }, [
@@ -1967,8 +1975,9 @@
     if (canEdit()) cWrap.append(el("button", { class: "tile-add", onclick: () => openNameForm("card") }, [icon("plus", 22)]));
     root.append(el("section", { class: "sec" }, [
       el("div", { class: "sec-head" }, [icon("card", 15), el("h2", { text: "카드" }),
-        canEdit() ? el("button", { class: "btn sm", onclick: () => openStatementReader() }, [icon("doc", 14), "명세서"]) : null,
-        el("span", { class: "sum num", text: brief(periodSum(S.entries.filter(e => e.kind === "card"))) })].filter(Boolean)),
+        el("span", { class: "chip", text: "기둥 기록을 카드별로 다시 본 것" }),
+        (canEdit() && S.sample) ? el("button", { class: "btn sm", onclick: () => openStatementReader() }, [icon("doc", 14), "명세서"]) : null,
+        el("span", { class: "sum num", text: brief(periodSum(S.entries.filter(paidByCard))) })].filter(Boolean)),
       cWrap
     ]));
     sortable(cWrap, ids => saveOrder("cards", ids));
@@ -2167,23 +2176,30 @@
   function viewCard(id) {
     const c = cardById(id);
     if (!c) { S.view = { type: "dash" }; return viewDash(); }
-    const list = entriesOf("card", c.id);
-    const byBill = {};
-    list.forEach(e => { const m = e.billMonth || ymOf(e.date); byBill[m] = (byBill[m] || 0) + krwTotal(e); });
-    const bills = Object.entries(byBill).filter(([m]) => (S.month ? m === S.month : m.startsWith(String(S.year)))).sort((a, b) => b[0].localeCompare(a[0]));
+    const list = cardEntries(c.id);
+    // 달별로 이 카드에서 얼마나 나갔나 — 어느 기둥에 적었든 카드 기준으로 모은다
+    const byMonth = {};
+    list.forEach(e => periodMonths(e).forEach(m => { byMonth[m] = (byMonth[m] || 0) + perMonthAt(e, m); }));
+    const bills = Object.entries(byMonth).sort((a, b) => b[0].localeCompare(a[0]));
+    // 어느 기둥에서 왔는지
+    const byPlace = {};
+    list.forEach(e => { const n = e.kind === "card" ? "카드에 직접" : (ownerOf(e).name || "기타");
+      byPlace[n] = (byPlace[n] || 0) + periodTotal(e); });
     const root = el("div", { style: "display:flex;flex-direction:column;gap:18px" }, [
       detailHero({
-        eyebrow: periodLabel() + " · 청구 기준", name: c.name, icon: "card", accent: c.accent, sum: periodSum(list),
+        eyebrow: periodLabel() + " · 이 카드로 나간 돈", name: c.name, icon: "card", accent: c.accent, sum: periodSum(list),
         series: monthlySeries(list, S.year),
         caps: [el("span", {}, [icon("doc", 13), " ", el("b", { text: list.filter(inPeriod).length + "건" }),
             el("span", { style: "color:var(--ink-3);margin-left:5px", text: "전체 " + list.length })]),
-          bills.length ? el("span", {}, [icon("clock", 13), " 청구 ", el("b", { text: dot(bills[0][0]) })]) : null].filter(Boolean)
+          cycleLabel(c, periodAnchor()) ? el("span", {}, [icon("clock", 13), " ", cycleLabel(c, periodAnchor())]) : null].filter(Boolean)
       })
     ]);
-    if (bills.length) {
+    // 어느 기둥에서 이 카드를 얼마나 썼나
+    const places = Object.entries(byPlace).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]);
+    if (places.length) {
       const w = el("div", { class: "minis" });
-      bills.slice(0, 6).forEach(([m, v]) => w.append(el("div", { class: "mini" }, [
-        el("div", { class: "top" }, [icon("clock", 13), el("span", { class: "c", text: dot(m) })]),
+      places.slice(0, 6).forEach(([n, v]) => w.append(el("div", { class: "mini" }, [
+        el("div", { class: "top" }, [icon("chart", 13), el("span", { class: "c", text: n })]),
         el("div", { class: "v", text: brief(v) })
       ])));
       root.append(w);
@@ -2195,7 +2211,7 @@
         el("div", { style: "margin-left:auto;display:flex;gap:8px" }, canEdit() ? [
           el("button", { class: "btn sm quiet", "aria-label": "카드 이름 고치기", onclick: () => openNameForm("card", c) }, [icon("pencil", 13)]),
           el("button", { class: "btn sm quiet", onclick: () => openEntryForm({ kind: "card", parent: c.id }) }, [icon("plus", 13)]),
-          el("button", { class: "btn sm primary", onclick: () => openStatementReader(c.id) }, [icon("doc", 14), "명세서"])
+          S.sample ? el("button", { class: "btn sm primary", onclick: () => openStatementReader(c.id) }, [icon("doc", 14), "명세서"]) : null
         ] : [el("span", { class: "chip view" }, ["보기 전용"])])
       ]),
       ledger(list, { byMonth: true, onAdd: () => openStatementReader(c.id) })
@@ -2415,7 +2431,7 @@
       el("button", { class: "navbtn ghost", onclick: () => openNameForm("group") }, [icon("plus", 13), "항목"])));
 
     swap("navCards", group("카드",
-      S.cards.map(c => navBtn(c.name, periodSum(entriesOf("card", c.id)), c.accent || "#ff6fd8",
+      S.cards.map(c => navBtn(c.name, periodSum(cardEntries(c.id)), c.accent || "#ff6fd8",
         S.view.type === "card" && S.view.id === c.id, go({ type: "card", id: c.id }))),
       el("button", { class: "navbtn ghost", onclick: () => openNameForm("card") }, [icon("plus", 13), "카드"])));
 
@@ -2427,7 +2443,7 @@
     swap("navCats", group("구분", items));
 
     swap("navTools", group("도구", [
-      canEdit() ? el("button", { class: "navbtn", onclick: () => { S.railOpen = false; renderRail(); openStatementReader(); } }, [icon("doc", 15), el("span", { class: "nm", text: "명세서 읽기" })]) : null,
+      (canEdit() && S.sample) ? el("button", { class: "navbtn", onclick: () => { S.railOpen = false; renderRail(); openStatementReader(); } }, [icon("doc", 15), el("span", { class: "nm", text: "명세서 읽기" })]) : null,
       S.entries.some(e => claimPending(e) > 0)
         ? el("button", { class: "navbtn", "aria-current": String(S.view.type === "claims"), onclick: go({ type: "claims" }) },
             [icon("wallet", 15), el("span", { class: "nm", text: "받을 돈" }),
