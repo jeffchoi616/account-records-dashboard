@@ -529,9 +529,16 @@
      보험료·월세처럼 매달 나가는 돈은 몇 해 뒤 금액이 오른다. 그때 금액을 그냥
      고치면 지난 달 기록까지 같이 바뀌어 버린다. 그래서 '이 달부터 이 금액'을
      steps 에 쌓고, 각 달은 그 달에 유효한 금액으로 센다. 지난 기록은 그대로다. */
+  /* 손으로 적어 둔 금액이 어느 달까지 가느냐는 방식에 따라 다르다.
+     · 할부  — 예정표(전체÷개월, 첫 회차 보정)가 이미 있다. 그러니 손으로 적은
+               **그 달만** 예외로 두고, 다음 달은 다시 예정표대로 간다.
+     · 매달  — 예정표가 없다(전세대출처럼 이율 따라 바뀐다). 그러니 마지막에
+               적은 값이 다음에 적을 때까지 계속 이어진다. */
   function stepAt(e, ym) {
+    const list = e.steps || [];
+    if (e.mode === "split") return list.find(s => s && s.from === ym) || null;
     let best = null;
-    (e.steps || []).forEach(s => {
+    list.forEach(s => {
       if (s && s.from && s.from <= ym && (!best || s.from > best.from)) best = s;
     });
     return best;
@@ -1012,9 +1019,27 @@
     // 청구일이 없던 옛 기록은 결제 기간 끝날을 먼저 쓴다 — 그게 실제 마감일이다
     const billIn = input({ type: "date", value: e.billDate || e.periodEnd || (e.billMonth ? e.billMonth + "-01" : e.date),
       onchange: ev => { e.billDate = ev.target.value; e.billMonth = ymOf(e.billDate); sync(); } });
+    /* 월 납입액은 자동(전체÷개월)과 직접 입력 사이를 언제든 오갈 수 있어야 한다.
+       칸만 두면 실수로 0 을 넣었을 때 자동으로 되돌릴 길이 안 보인다. */
     const monthlyIn = input({ type: "number", step: "1", min: "0", value: e.monthly || "", placeholder: "자동",
       oninput: ev => { e.monthly = +ev.target.value || 0; sync(); } });
-    const monthlyBox = field("월 납입액", monthlyIn, "명세서에 적힌 값. 비우면 전체÷개월");
+    const monthlyPick = segmented([{ v: "auto", t: "자동" }, { v: "manual", t: "직접" }],
+      e.monthly ? "manual" : "auto", v => {
+        if (v === "auto") { e.monthly = 0; monthlyIn.value = ""; }
+        else if (!e.monthly) {
+          // 직접으로 바꾸면 자동 계산값을 미리 채워 준다 — 빈 칸보다 고치기 쉽다
+          e.monthly = Math.round(krwTotal(e) / Math.max(1, e.months || 1));
+          monthlyIn.value = e.monthly;
+        }
+        monthlyIn.disabled = v === "auto";
+        sync();
+      });
+    monthlyIn.disabled = !e.monthly;
+    const monthlyBox = el("div", { class: "field" }, [
+      el("label", { text: "월 납입액" }),
+      el("div", { class: "grid2", style: "gap:10px" }, [monthlyPick, monthlyIn]),
+      el("div", { class: "hint", text: "자동은 전체÷개월. 명세서에 적힌 값이 다르면 직접 넣으세요." })
+    ]);
     const monthsBox = field("개월", monthsIn);
     const endBox = field("끝나는 날", endIn, "비우면 계속");
 
@@ -1216,9 +1241,21 @@
         el("div", { class: "grid3" }, [field("어느 달", dayIn, "이 날이 든 달"),
           field(e.mode === "split" ? "월 납입액" : "금액", amtIn), field("통화", curSel)]),
         rateBox, out,
-        el("div", { class: "hint", text: "적은 달부터 이 금액으로 이어집니다. 그 전 달 기록은 그대로예요." })
+        el("div", { class: "hint", text: e.mode === "split"
+          ? "이 달만 이 금액이 됩니다. 다음 달은 다시 자동으로 돌아가요."
+          : "적은 달부터 이 금액으로 이어집니다. 그 전 달 기록은 그대로예요." })
       ],
       foot: [
+        // 이미 손으로 적어 둔 달이면 자동으로 되돌릴 수 있어야 한다
+        stepAt(e, st.ym) ? el("button", {
+          class: "btn quiet", style: "margin-right:auto",
+          onclick: async () => {
+            const body = Object.assign({}, e, { steps: (e.steps || []).filter(x => x.from !== st.ym) });
+            delete body.id;
+            await put("entries", e.id, body);
+            m.close(); toast(dot(st.ym) + " 을 자동으로 되돌렸어요.");
+          }
+        }, [icon("eraser", 14), "자동으로"]) : null,
         el("button", { class: "btn quiet", onclick: () => m.close() }, ["취소"]),
         el("button", {
           class: "btn primary", onclick: async () => {
@@ -1234,7 +1271,7 @@
             m.close(); toast(dot(st.ym) + " 금액을 적었어요.");
           }
         }, ["적기"])
-      ]
+      ].filter(Boolean)
     });
     setTimeout(() => { amtIn.focus(); amtIn.select(); }, 60);
   }
